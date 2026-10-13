@@ -1,0 +1,22 @@
+services:
+  codearts:
+    build: .
+    container_name: codearts-manager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:29137:29137"
+      - "127.0.0.1:8000:29137"
+    env_file:
+      - .env
+    environment:
+      # Point the hot-reload watcher at the bind-mounted host copy below.
+      # Single-file bind mounts pin an inode, so editor tmp+rename (sed -i,
+      # vim :wq) leaves the container reading the stale inode. Mounting the
+      # parent directory instead makes lookups path-based, so rename survives.
+      - CODEARTS_ENV_FILE=/app/host/.env
+    volumes:
+      - codearts_data:/data
+      - ./:/app/host:ro
+
+volumes:
+  codearts_data:

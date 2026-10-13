@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CodeArts Manager</title>
+<!--BASE-->
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="login-page" class="login-wrap">
+  <form id="login-form" class="login-card">
+    <div class="logo">CodeArts Manager</div>
+    <div class="sub">管理面板安全登录</div>
+    <label>管理密码</label>
+    <input type="password" id="password" placeholder="Admin Password" autocomplete="current-password" autofocus>
+    <button type="submit" class="btn primary block">登录</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</div>
+
+<div id="app" class="layout hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <h1>CodeArts Manager</h1>
+      <div class="ver">Huawei · Go Proxy</div>
+    </div>
+    <nav class="nav" id="nav">
+      <a data-page="overview" class="active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+        总览
+      </a>
+      <a data-page="accounts">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        账户池
+      </a>
+      <a data-page="proxies">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="m4.9 4.9 2.1 2.1"/><path d="m17 17 2.1 2.1"/><path d="M2 12h3"/><path d="M19 12h3"/><path d="m4.9 19.1 2.1-2.1"/><path d="m17 7 2.1-2.1"/></svg>
+        代理池
+      </a>
+      <a data-page="models">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
+        模型
+      </a>
+      <a data-page="apikeys">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        API Key
+      </a>
+      <a data-page="oauth">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
+        CLI 授权
+      </a>
+    </nav>
+    <div class="side-foot">
+      <div>Base: <span id="base-url">/v1</span></div>
+      <button id="logout-btn" class="btn sm block" style="margin-top:10px">退出登录</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="page active" id="p-overview">
+      <div class="page-head">
+        <div><h2>总览</h2><div class="sub" id="ov-sub">账号 · Token · 额度 · 粘滞</div></div>
+        <div class="row" style="gap:8px">
+          <span class="live-badge">LIVE <span id="live-indicator">—</span></span>
+          <button class="btn" id="pause-refresh-btn" onclick="toggleAutoRefresh()">⏸ 暂停刷新</button>
+          <button class="btn" onclick="refreshAll(true)">↻ 刷新额度</button>
+        </div>
+      </div>
+      <div class="grid grid-4" id="stats"></div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>协议分布 / 慢请求 (今日)</h3>
+        <div class="chart-row">
+          <svg class="chart-donut" id="chart-proto-donut" viewBox="0 0 120 120"></svg>
+          <div class="usage-strip" id="proto-strip" style="flex:1;min-width:260px"></div>
+        </div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>账号健康分布</h3>
+        <div class="chart-row">
+          <svg class="chart-donut" id="chart-health-donut" viewBox="0 0 120 120"></svg>
+          <div class="legend legend-col" id="health-legend"></div>
+          <div class="grid grid-health" id="health-stats" style="flex:1;min-width:280px"></div>
+        </div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card" id="key-usage-card" style="display:none">
+        <h3>API Key 在途 / 用量</h3>
+        <div class="usage-strip" id="key-usage-strip"></div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>Token 用量</h3>
+        <div class="usage-strip" id="usage-strip"></div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>小时级流量趋势 (24h · 东八区)</h3>
+        <div class="chart-wrap"><svg class="chart" id="chart-timeline" viewBox="0 0 800 220" preserveAspectRatio="none"></svg></div>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--accent)"></span>请求数</span>
+          <span><span class="dot" style="background:#7dd3fc"></span>输入 token</span>
+          <span><span class="dot" style="background:var(--green)"></span>输出 token</span>
+          <span><span class="dot" style="background:var(--red)"></span>错误</span>
+        </div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>账号池快览</h3>
+        <div id="acct-mini" class="empty">加载中...</div>
+        <div class="mini-head" style="display:none"></div>
+      </div>
+    </section>
+
+    <section class="page" id="p-accounts">
+      <div class="page-head">
+        <div><h2>账户池</h2><div class="sub" id="acct-sub">导入 txt / 手动添加 / Token 刷新 · 默认列出全部账号</div></div>
+        <div class="row" style="gap:8px">
+          <button class="btn" onclick="refreshAll(true)">↻ 刷新额度</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>导入 txt</h3>
+        <div class="muted" style="margin-bottom:8px">格式一行一条：<code>账号----密码----ak----sk</code> · 同邮箱覆盖 · 可粘贴或选文件</div>
+        <textarea id="import-text" rows="6" placeholder="user@mail.com----Pass123!----HPUA...----xxxx"></textarea>
+        <div class="import-toolbar">
+          <div class="file-picker">
+            <input type="file" id="import-file" accept=".txt,text/plain" hidden>
+            <button type="button" class="btn file-btn" id="import-file-btn">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>
+              选择文件
+            </button>
+            <span class="file-name muted" id="import-file-name">未选择文件</span>
+          </div>
+          <label class="check-pill">
+            <input type="checkbox" id="import-refresh-quota" checked>
+            <span>导入后刷新额度</span>
+          </label>
+          <span class="muted dedup-note" title="已存在的邮箱或 AK 会自动跳过，不会重复导入">⛨ 自动去重（仅导入全新账号）</span>
+          <button class="btn primary" id="import-accounts">导入账号</button>
+        </div>
+        <pre id="import-result" class="empty">等待导入…</pre>
+      </div>
+      <div class="card">
+        <h3>添加账号</h3>
+        <div class="row">
+          <input id="new-email" placeholder="邮箱">
+          <input id="new-password" type="password" placeholder="密码">
+          <input id="new-country" placeholder="地区码" value="SG" style="width:80px">
+          <button class="btn primary" id="add-account">＋ 添加</button>
+        </div>
+        <div class="muted">用已注册账号手动添加，再写入官方永久 AK/SK</div>
+      </div>
+      <div class="card">
+        <h3>账户列表 <span class="muted" id="accounts-total"></span></h3>
+        <div class="list-toolbar">
+          <div class="seg" id="acct-filter">
+            <button type="button" class="seg-item active" data-filter="all">全部</button>
+            <button type="button" class="seg-item" data-filter="ready">可调用</button>
+            <button type="button" class="seg-item" data-filter="quota_exhausted">透支中</button>
+            <button type="button" class="seg-item" data-filter="disabled">已禁用</button>
+          </div>
+          <input id="acct-search" placeholder="搜索邮箱 / ID" style="min-width:200px">
+          <button class="btn ghost" id="refresh-all-quota">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+            全部刷额度
+          </button>
+        </div>
+        <div class="batch-bar" id="acct-batch-bar">
+          <label class="check-pill"><input type="checkbox" id="acct-check-all"> 全选当前</label>
+          <span class="muted" id="acct-sel-count">已选 0</span>
+          <button class="btn sm" data-batch-acct="enable">批量启用</button>
+          <button class="btn sm" data-batch-acct="disable">批量禁用</button>
+          <button class="btn sm" data-batch-acct="refresh_quota">刷额度</button>
+          <select id="acct-batch-proxy" style="min-width:180px"></select>
+          <button class="btn sm" data-batch-acct="set_proxy">应用出站</button>
+          <button class="btn sm danger" data-batch-acct="delete">批量删除</button>
+        </div>
+        <div class="tbl-wrap">
+          <table id="accounts-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th data-sort="email">邮箱</th><th data-sort="gate">调用态</th><th>套餐</th><th data-sort="reset">周期 / 重置</th>
+                <th data-sort="remain">额度（已用 / 总量 / 剩余）</th><th data-sort="expire">到期</th>
+                <th data-sort="success">成功/失败</th>
+                <th>出站</th>
+                <th data-sort="last_used">最近使用</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="p-proxies">
+      <div class="page-head">
+        <div><h2>代理池</h2><div class="sub">独立模块 · proxies.json · sticky / 轮询 / 随机</div></div>
+        <button class="btn" onclick="loadProxies()">↻ 刷新</button>
+      </div>
+      <div class="card">
+        <h3>调度策略</h3>
+        <div class="row">
+          <select id="proxy-strategy">
+            <option value="sticky">sticky（仅绑定账号走代理；未绑定直连）</option>
+            <option value="round_robin">round_robin（仅绑定账号；未绑定直连）</option>
+            <option value="random">random（仅绑定账号；未绑定直连）</option>
+          </select>
+          <button class="btn primary" id="proxy-strategy-save">保存策略</button>
+          <span class="muted" id="proxy-stats"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>添加代理</h3>
+        <div class="row">
+          <input id="px-name" placeholder="备注名（可选）" style="min-width:120px">
+          <select id="px-type">
+            <option value="socks5h">socks5h</option>
+            <option value="socks5">socks5</option>
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+          <input id="px-host" placeholder="host" style="min-width:140px">
+          <input id="px-port" placeholder="port" style="width:90px" type="number" min="1" max="65535">
+          <input id="px-user" placeholder="username" style="min-width:110px">
+          <input id="px-pass" placeholder="password" type="password" style="min-width:110px">
+          <button class="btn" id="px-test-inline">测连通</button>
+          <button class="btn primary" id="px-add">添加</button>
+        </div>
+        <div class="muted" style="margin-top:8px">支持粘贴一行：<code>socks5://user:pass@host:port</code> 或 <code>host:port</code></div>
+        <div class="row" style="margin-top:8px">
+          <input id="px-line" placeholder="socks5h://user:pass@1.2.3.4:1080" style="flex:1;min-width:260px">
+          <button class="btn" id="px-parse-line">解析填入</button>
+        </div>
+        <pre id="px-test-out" class="empty" style="margin-top:8px">测试结果…</pre>
+      </div>
+      <div class="card">
+        <h3>批量导入代理</h3>
+        <div class="muted" style="margin-bottom:8px">每行一条：<code>socks5h://u:p@host:port</code> / <code>host:port</code> / <code>user:pass@host:port</code></div>
+        <textarea id="px-import-text" rows="5" placeholder="socks5h://user:pass@1.2.3.4:1080&#10;2.2.2.2:1080"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary" id="px-import-btn">批量导入</button>
+          <span class="muted" id="px-import-result"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>代理列表 <span class="muted" id="proxies-total"></span></h3>
+        <div class="batch-bar" id="proxy-batch-bar">
+          <label class="check-pill"><input type="checkbox" id="proxy-check-all"> 全选</label>
+          <span class="muted" id="proxy-sel-count">已选 0</span>
+          <button class="btn sm" data-batch-proxy="enable">批量启用</button>
+          <button class="btn sm" data-batch-proxy="disable">批量禁用</button>
+          <button class="btn sm" data-batch-proxy="test">批量测试</button>
+          <button class="btn sm danger" data-batch-proxy="delete">批量删除</button>
+        </div>
+        <div class="tbl-wrap">
+          <table id="proxies-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th data-sort="name">名称</th><th data-sort="type">类型</th><th data-sort="address">地址</th><th data-sort="status">状态</th>
+                <th data-sort="success">成功/失败</th><th>最近错误</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h3>账号绑定代理</h3>
+        <div class="row">
+          <select id="bind-account" style="min-width:220px"></select>
+          <select id="bind-proxy" style="min-width:220px"></select>
+          <button class="btn primary" id="bind-proxy-save">保存出站</button>
+          <button class="btn" id="bind-proxy-clear">设为直连</button>
+        </div>
+        <div class="muted">选「直连（不绑定）」则该账号不走代理池，和官方 CLI 一样直连。只有显式选中的代理才会套到这个账号上。</div>
+      </div>
+    </section>
+
+    <section class="page" id="p-models">
+      <div class="page-head">
+        <div><h2>模型</h2><div class="sub">OpenAI 兼容 · GET /v1/models</div></div>
+        <button class="btn" onclick="loadModels()">↻ 同步</button>
+      </div>
+      <div class="card">
+        <div class="muted" id="models-hint" style="margin-bottom:10px"></div>
+        <div class="tbl-wrap">
+          <table id="models-table">
+            <thead><tr><th data-sort="id">ID</th><th data-sort="object">Object</th><th data-sort="owned_by">Owned By</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="p-apikeys">
+      <div class="page-head">
+        <div><h2>API Key</h2><div class="sub">创建时指定可用账号 · 空=全池 · 测试可只勾透支号</div></div>
+        <button class="btn" onclick="loadAPIKeys()">↻ 刷新</button>
+      </div>
+      <div class="card">
+        <h3>创建密钥</h3>
+        <div class="muted" style="margin-bottom:10px">创建后明文只显示一次。只要存在启用中的 Key（或配置了环境变量 API_KEY），调用 /v1 就必须带 <code>Authorization: Bearer …</code>。</div>
+        <div class="row">
+          <input id="apikey-name" placeholder="备注名，例如 cursor / 测试透支" style="min-width:220px">
+          <button class="btn primary" id="apikey-create">＋ 创建 API Key</button>
+        </div>
+        <div class="key-scope">
+          <label class="check-pill"><input type="radio" name="key-scope" value="all" checked> 全部账号</label>
+          <label class="check-pill"><input type="radio" name="key-scope" value="pick"> 指定账号</label>
+          <button type="button" class="btn sm" id="key-pick-exhausted">勾选透支中</button>
+          <button type="button" class="btn sm" id="key-pick-ready">勾选可调用</button>
+          <button type="button" class="btn sm" id="key-pick-none">清空勾选</button>
+        </div>
+        <div class="muted" style="margin:8px 0">指定账号后，这个 Key 只能打勾选的号。测试透支就只勾「透支中」。</div>
+        <div id="key-acct-list" class="acct-pick-list" hidden></div>
+        <pre id="apikey-secret-box" class="empty" style="margin-top:10px;display:none"></pre>
+      </div>
+      <div class="card">
+        <h3>密钥列表 <span class="muted" id="apikeys-meta"></span></h3>
+        <div class="batch-bar" id="apikey-batch-bar">
+          <label class="check-pill"><input type="checkbox" id="apikey-check-all"> 全选</label>
+          <span class="muted" id="apikey-sel-count">已选 0</span>
+          <button class="btn sm" data-batch-apikey="enable">批量启用</button>
+          <button class="btn sm" data-batch-apikey="disable">批量禁用</button>
+          <button class="btn sm danger" data-batch-apikey="delete">批量删除</button>
+        </div>
+        <div class="tbl-wrap">
+          <table id="apikeys-table">
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th data-sort="name">名称</th><th>前缀</th><th data-sort="status">状态</th><th>可用账号</th><th data-sort="in_flight">在途</th><th data-sort="usage">用量</th><th data-sort="created">创建时间</th><th data-sort="last_used">最近使用</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="apikey-edit-box" class="acct-pick-list" style="margin-top:12px;display:none"></div>
+      </div>
+      <div class="card">
+        <h3>调用示例</h3>
+        <pre id="apikey-sample"></pre>
+      </div>
+    </section>
+
+    <section class="page" id="p-oauth">
+      <div class="page-head">
+        <div><h2>CLI 授权</h2><div class="sub">官方路径：IAM 永久 AK/SK → CODEARTS_CLI_AK / CODEARTS_CLI_SK</div></div>
+      </div>
+      <div class="card">
+        <h3>1. 官方永久 AK/SK（推荐）</h3>
+        <div class="muted" style="margin-bottom:10px">对齐《CLI授权指导》：IAM 永久密钥写入后即可拉模型与额度，无需浏览器 OAuth。</div>
+        <div class="row">
+          <select id="oauth-account"></select>
+          <input id="iam-ak" placeholder="Access Key Id" style="min-width:220px">
+          <input id="iam-sk" placeholder="Secret Access Key" style="min-width:260px">
+          <button class="btn primary" id="iam-save">写入永久 AK/SK</button>
+          <button class="btn" id="oauth-copy-login">复制 账号----密码</button>
+        </div>
+        <div id="oauth-login-line" class="login-line empty">选中账号后显示 邮箱----密码</div>
+        <pre id="cli-env-sample" class="empty" style="margin-top:8px">PowerShell:
+$env:CODEARTS_CLI_AK="Access Key Id"
+$env:CODEARTS_CLI_SK="Secret Access Key"</pre>
+      </div>
+      <div class="card">
+        <h3>2. 备用：浏览器 OAuth（临时 STS）</h3>
+        <div class="row">
+          <button class="btn" id="oauth-start">全新 OAuth</button>
+        </div>
+        <div class="muted">临时票会过期。官方 CLI 主路径是永久 AK/SK。</div>
+        <div id="oauth-status" class="muted" style="margin-top:8px">未开始</div>
+        <pre id="oauth-output" class="empty">等待发起…</pre>
+      </div>
+      <div class="card">
+        <h3>调用示例</h3>
+        <pre id="api-sample"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
