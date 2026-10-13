@@ -4,4 +4,3 @@ data/
 *.db
 *.exe
 *.log
-.env.example
