@@ -48,6 +48,13 @@ func (s *Server) callableHuaweiAccountsFor(key *store.APIKey) []*store.Account {
 		if !a.Callable(now) {
 			continue
 		}
+		// CN 渠道：总闸关闭或 refresh token 终态失效（cn_needs_relogin，
+		// 需 cnlogin 重登）的账号不进可调用集合，避免每次轮转到它们再弹回。
+		if store.NormalizeChannel(a.Channel) == store.ChannelCN {
+			if !s.cfg.CNEnabled || a.Metadata["cn_needs_relogin"] == "true" {
+				continue
+			}
+		}
 		if !key.AllowsAccount(a.ID) {
 			continue
 		}

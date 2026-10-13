@@ -50,7 +50,7 @@ func newCNTestServer(t *testing.T, upstreamURL string, acc *store.Account) (*Ser
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(config.Config{CNUpstreamTimeout: 5 * time.Second, DataDir: dir}, db, authMgr, nil)
+	s := New(config.Config{CNEnabled: true, CNUpstreamTimeout: 5 * time.Second, DataDir: dir}, db, authMgr, nil)
 	// 注入指向假上游的 cnup 客户端（生产路径走 cnUpstream 懒构造）。
 	s.cnOnce.Do(func() {
 		s.cnClient = cnup.NewWithChatEndpoint(5*time.Second, upstreamURL)
@@ -137,7 +137,100 @@ func TestCNChatIDResolution(t *testing.T) {
 	}
 }
 
-// needs_relogin 打标的 CN 账号：handleCNChat 直接返回 rotate，不写响应。
+// /v1/models 把已检出的 CN 模型目录以 cn: 前缀合流。
+func TestCNModelsMergedWithPrefix(t *testing.T) {
+	up := fakeCNUpstream(t)
+	defer up.Close()
+	s, ts, _ := newCNTestServer(t, up.URL, cnTestAccount("cn-5"))
+	cnup.SetAccountModels("uid-1", []cnup.ModelInfo{{ID: "Qwen3-VL-235B"}})
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/v1/models", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = s
+	found := map[string]bool{}
+	for _, m := range payload.Data {
+		found[m.ID] = true
+	}
+	if !found["cn:Qwen3-VL-235B"] {
+		t.Fatal("missing cn:Qwen3-VL-235B in /v1/models")
+	}
+	// 注意：裸名 Qwen3-VL-235B 可能已存在于国际 fallback 目录，此处只断言
+	// cn: 前缀条目必须出现（渠道可分辨）。
+}
+
+// 渠道前缀解析（workbuddy2api realm 前缀协议）。
+func TestCNSplitChannelModel(t *testing.T) {
+	cases := []struct{ in, realm, bare string }{
+		{"cn:snap-chat", "cn", "snap-chat"},
+		{"cn:qwen3-vl-235b", "cn", "qwen3-vl-235b"},
+		{"intl:GLM-5.2", "intl", "GLM-5.2"},
+		{"global:GLM-5.2", "intl", "GLM-5.2"},
+		{"snap-chat", "", "snap-chat"},
+		{"", "", ""},
+		{"weird:name", "", "weird:name"},
+	}
+	for _, c := range cases {
+		if r, b := cnSplitChannelModel(c.in); r != c.realm || b != c.bare {
+			t.Errorf("cnSplitChannelModel(%q)=(%q,%q), want (%q,%q)", c.in, r, b, c.realm, c.bare)
+		}
+	}
+}
+
+// cn: 前缀强制 CN 渠道，且模型走 CN canonical 管线（不被 intl
+// rewriteModel 改写；qwen3-vl-235b 应交上游 Qwen3-VL-235B 而非 GLM-5.2）。
+func TestCNPrefixForcesCNChannelAndModel(t *testing.T) {
+	var gotModel string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if m, _ := body["model"].(string); m != "" {
+			gotModel = m
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	// 池里同放 intl 账号：前缀必须保证不选它。
+	_, ts, db := newCNTestServer(t, up.URL, cnTestAccount("cn-4"))
+	intlAcc := &store.Account{
+		ID:    "intl-1",
+		Email: "intl@example.com",
+		Credentials: &store.Credentials{
+			AccessKeyID: "AKINTL", SecretAccessKey: "SKINTL", AuthMode: "iam_permanent",
+		},
+	}
+	if err := db.Upsert(intlAcc); err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/v1/chat/completions", strings.NewReader(
+			`{"model":"cn:qwen3-vl-235b","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if gotModel != "Qwen3-VL-235B" {
+		t.Fatalf("upstream model=%q (intl rewrite or wrong dispatch leaked)", gotModel)
+	}
+}
 func TestCNChatNeedsReloginSkipped(t *testing.T) {
 	up := fakeCNUpstream(t)
 	defer up.Close()

@@ -677,6 +677,27 @@ func (s *Server) collectedModelIDs() []string {
 		}
 	}
 	add(huawei.FallbackModelIDs)
+	// CN 渠道模型目录以 "cn:" 前缀合流（workbuddy2api 的 realm 前缀协议）：
+	// 检出目录按账号缓存（cnwatch/登录时拉取），同 ID 与国际侧不冲突——
+	// 客户端用前缀显式选渠道。
+	if s.db != nil {
+		for _, a := range s.db.List() {
+			if a == nil || store.NormalizeChannel(a.Channel) != store.ChannelCN || a.UserID == "" {
+				continue
+			}
+			infos, ok := cnup.AccountModels(a.UserID)
+			if !ok {
+				continue
+			}
+			ids := make([]string, 0, len(infos))
+			for _, m := range infos {
+				if m.ID != "" {
+					ids = append(ids, store.ChannelCN+":"+m.ID)
+				}
+			}
+			add(ids)
+		}
+	}
 	return out
 }
 
@@ -805,8 +826,26 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		s.tryLCPPromote(sessionID, lcpKey)
 	}
 	rid := reqIDFromRequest(r)
-	// Official CLI body only. Do not inject intercept extras (cache key, etc.).
-	body = sanitizeCLIChatBody(body)
+	// Channel realm routing (borrowed the realm-prefix protocol from
+	// workbuddy2api): "cn:<model>" forces CN-channel accounts,
+	// "intl:<model>" forces international accounts, bare names keep the
+	// dual-realm default. The prefix is stripped before sanitize so the
+	// intl alias rewrite never mangles CN-canonical model names
+	// (e.g. snap-chat must NOT become GLM-5.2 on the CN channel).
+	cnRealm, cnBareModel := cnSplitChannelModel(peekModel(body))
+	if cnRealm != "" {
+		if body = rewriteBodyModel(body, cnBareModel); cnRealm == store.ChannelCN {
+			body = sanitizeCLIChatBodyOpt(body, true)
+		} else {
+			body = sanitizeCLIChatBody(body)
+		}
+	} else {
+		body = sanitizeCLIChatBody(body)
+	}
+	if cnRealm == store.ChannelCN && !s.cfg.CNEnabled {
+		writeErr(w, http.StatusServiceUnavailable, "cn channel disabled (CN_ENABLED=false)")
+		return
+	}
 	body = s.restoreThink(body)
 	// Never rewrite the body to force it under Huawei's 307200-token limit —
 	// the client owns conversation history and its own compaction (manual or
@@ -864,7 +903,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	valid := s.callableHuaweiAccountsFor(reqKey)
+	valid := filterAccountsByRealm(s.callableHuaweiAccountsFor(reqKey), cnRealm)
 	if len(valid) == 0 {
 		recordStats(wantStream, false, 0, 0, 0)
 		if reqKey != nil && len(reqKey.AccountIDs) > 0 {
@@ -1002,7 +1041,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 				goto pickExhausted
 			case <-time.After(wait):
 			}
-			valid = s.callableHuaweiAccountsFor(reqKey)
+			valid = filterAccountsByRealm(s.callableHuaweiAccountsFor(reqKey), cnRealm)
 			if i > 0 && i%12 == 0 {
 				tried = map[string]bool{}
 			}
@@ -1182,7 +1221,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 					if stickyHit {
 						s.sessionStick.Invalidate(sessionID)
 					}
-					valid = s.callableHuaweiAccountsFor(reqKey)
+					valid = filterAccountsByRealm(s.callableHuaweiAccountsFor(reqKey), cnRealm)
 					endLease(acc.ID)
 					log.Printf("chat quota_rotate rid=%s account=%s early=%v", rid, acc.ID, early)
 					continue
@@ -1541,7 +1580,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 			if stickyHit {
 				s.sessionStick.Invalidate(sessionID)
 			}
-			valid = s.callableHuaweiAccountsFor(reqKey)
+			valid = filterAccountsByRealm(s.callableHuaweiAccountsFor(reqKey), cnRealm)
 			endLease(acc.ID)
 			continue
 		}

@@ -98,6 +98,23 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 	return true, false
 }
 
+// rewriteBodyModel 复写请求体顶层 model 字段（剥渠道前缀用）。
+func rewriteBodyModel(body []byte, model string) []byte {
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil || root == nil {
+		return body
+	}
+	if _, ok := root["model"]; !ok {
+		return body
+	}
+	root["model"] = model
+	raw, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return raw
+}
+
 func (s *Server) cnUpstream() *cnup.Client {
 	s.cnOnce.Do(func() {
 		s.cnClient = cnup.New(s.cfg.CNUpstreamTimeout)
@@ -301,6 +318,37 @@ func cnIsAuthErr(err error) bool {
 	msg := strings.ToLower(ue.Msg + " " + ue.Code)
 	return strings.Contains(msg, "401") || strings.Contains(msg, "unauthorized") ||
 		strings.Contains(msg, "invalid token") || strings.Contains(msg, "token expired")
+}
+
+// cnSplitChannelModel 解析模型名的渠道前缀路由（借鉴 workbuddy2api 的
+// realm 前缀协议）："cn:<model>" 强制只选 CN 渠道账号，"intl:<model>"
+// 强制只选国际账号；无前缀保持现状双亲调度。返回 (realm, bare)。
+// realm ∈ {"", "cn", "intl"}。
+func cnSplitChannelModel(model string) (realm, bare string) {
+	if i := strings.Index(model, ":"); i > 0 {
+		switch model[:i] {
+		case store.ChannelCN:
+			return store.ChannelCN, model[i+1:]
+		case store.ChannelIntl, "global":
+			return store.ChannelIntl, model[i+1:]
+		}
+	}
+	return "", model
+}
+
+// filterAccountsByRealm 按渠道过滤候选账号集合；realm=="" 原样返回
+// （零改动语义，同 workbuddy PickExcludingForRealm 的退化分支）。
+func filterAccountsByRealm(accounts []*store.Account, realm string) []*store.Account {
+	if realm == "" {
+		return accounts
+	}
+	out := accounts[:0:0]
+	for _, a := range accounts {
+		if a != nil && store.NormalizeChannel(a.Channel) == realm {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // cnTouchActive records chat activity for cnwatch keepalive gating.

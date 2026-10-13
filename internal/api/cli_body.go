@@ -136,6 +136,10 @@ func isHuaweiModel(model string) bool {
 // sanitizeCLIChatBody rewrites any inbound chat body to the official CLI shape:
 // Chat Completions with messages. Responses `input` and client extras are not forwarded.
 func sanitizeCLIChatBody(body []byte) []byte {
+	return sanitizeCLIChatBodyOpt(body, false)
+}
+
+func sanitizeCLIChatBodyOpt(body []byte, skipModelRewrite bool) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -144,7 +148,7 @@ func sanitizeCLIChatBody(body []byte) []byte {
 		return body
 	}
 	changed := false
-	if rewriteModel(root) {
+	if !skipModelRewrite && rewriteModel(root) {
 		changed = true
 	}
 	if _, ok := root["messages"]; !ok {

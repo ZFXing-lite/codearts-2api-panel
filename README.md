@@ -15,6 +15,18 @@
 - 🗨️ **会话续接**：CN 渠道按账号维持 `chat_id` 上下文，多轮对话自动续接
 - 🌍 **代理池**：账号级 HTTP / SOCKS5 代理绑定与连通性探测
 
+## 🧭 渠道路由（realm 前缀）
+
+模型名支持渠道前缀显式选道（借鉴 [workbuddy2api](https://github.com/ZFXing-lite/workbuddy2api) 的 realm 协议）：
+
+| 模型名写法 | 路由 |
+|---|---|
+| `cn:snap-chat` / `cn:qwen3-vl-235b` | 只从国内码道账号选号，模型走 CN canonical 管线（不被国际别名改写） |
+| `intl:GLM-5.2` / `global:GLM-5.2` | 只从国际账号选号 |
+| `GLM-5.2`（无前缀） | 双亲调度：全池统一熔断/轮换/粘性，选中哪边就走哪边协议 |
+
+`/v1/models` 返回国际目录 + `cn:` 前缀的 CN 账号已检出模型目录。CN 渠道总闸 `CN_ENABLED=false` 时 CN 账号整批不进可调集合。
+
 ## 🚀 快速开始
 
 ### Docker Compose（推荐）
