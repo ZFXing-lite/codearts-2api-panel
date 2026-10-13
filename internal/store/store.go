@@ -167,8 +167,17 @@ func (q *QuotaSnapshot) PackageLooksExpired(now time.Time) bool {
 }
 
 type Account struct {
-	ID              string            `json:"id"`
-	Email           string            `json:"email"`
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	// Channel identifies the account source: "intl" = default stock (国际版),
+	// "cn" = 国内码道渠道. Empty legacy rows behave as intl via NormalizeChannel.
+	Channel string `json:"channel,omitempty"`
+	// CN-channel credentials (国内码道, imported from codearts2api auths/*.json).
+	// UserID prefixes nothing extra; AccessToken is the cloud_dragon_token used
+	// as x-auth-token upstream; ChatID pins the 会话续接 thread.
+	UserID          string            `json:"user_id,omitempty"`
+	AccessToken     string            `json:"access_token,omitempty"`
+	ChatID          string            `json:"chat_id,omitempty"`
 	Password        string            `json:"password,omitempty"`
 	CountryCode     string            `json:"country_code"`
 	Status          string            `json:"status"`

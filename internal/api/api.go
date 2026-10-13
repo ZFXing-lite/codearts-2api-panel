@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go-codearts/internal/auth"
+	"go-codearts/internal/cnup"
 	"go-codearts/internal/config"
 	"go-codearts/internal/huawei"
 	"go-codearts/internal/proxypool"
@@ -107,6 +108,12 @@ type Server struct {
 
 	httpDefault   *http.Client // shared direct client — CLI-style connection reuse
 	httpDefaultMu sync.Mutex
+
+	// CN channel (国内码道) upstream plumbing — see cnchat.go.
+	cnOnce   sync.Once
+	cnClient *cnup.Client
+	cnSemaMu sync.Mutex
+	cnSema   map[string]chan struct{} // accountID -> per-account in-flight slots
 
 	// Cached chat HTTP clients per (direct/proxy) key — avoids per-request
 	// transport clone that defeated connection pooling (BUG-7 fix).
@@ -1038,6 +1045,22 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		// Reliability metric: any retry attempt that reaches an upstream call is a rotation.
 		if i > 0 {
 			s.reqStats.NoteEvent("rotation")
+		}
+		// CN channel (国内码道) — self-contained branch, see cnchat.go.
+		if store.NormalizeChannel(acc.Channel) == store.ChannelCN {
+			committed, cnRetry := s.handleCNChat(relayCtx, w, r, body, acc, wantStream, proto, peekModel(body))
+			if committed {
+				releaseLease(acc.ID, acc.Depleted())
+				recordStats(wantStream, true, 0, 0, 0)
+				return
+			}
+			endLease(acc.ID)
+			if cnRetry {
+				upstreamTries++
+				continue
+			}
+			recordStats(wantStream, false, 0, 0, 0)
+			return
 		}
 		creds := s.accountOAuthCreds(acc)
 		userToken := ""
@@ -2261,6 +2284,9 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		RefreshToken: req.RefreshToken,
 		Metadata:     meta,
 	}
+	if a.Channel == "" {
+		a.Channel = store.ChannelIntl
+	}
 	if a.Credentials != nil && !a.Credentials.Expiration.IsZero() {
 		a.TokenExpires = a.Credentials.Expiration
 	}
@@ -2385,6 +2411,9 @@ func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
 				CountryCode: cc,
 				CreatedAt:   time.Now(),
 			}
+		}
+		if a.Channel == "" {
+			a.Channel = store.ChannelIntl
 		}
 		if line.Password != "" {
 			a.Password = line.Password
@@ -3049,6 +3078,9 @@ func (s *Server) bindOAuthToken(pending pendingOAuth, res *huawei.OAuthTokenResu
 	}
 	if acc == nil {
 		acc = &store.Account{ID: randID("acc"), CountryCode: s.cfg.RegisterAreaCode, CreatedAt: time.Now()}
+	}
+	if acc.Channel == "" {
+		acc.Channel = store.ChannelIntl
 	}
 	if acc.Email == "" {
 		acc.Email = pending.LoginEmail

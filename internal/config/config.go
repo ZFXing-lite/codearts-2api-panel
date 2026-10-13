@@ -55,6 +55,22 @@ type Config struct {
 	// Long tasks (hours) need a wider window than the old 180s.
 	SSEIdleTimeout time.Duration
 
+	// CN channel (国内码道/盘古助手) — accounts imported from CN_AUTH_DIR auths/*.json.
+	CNEnabled           bool
+	CNAuthDir           string
+	CNDefaultModel      string
+	CNSoftCooldown      time.Duration // per-account soft cooldown between picks
+	CNErrThreshold      int           // consecutive errors before cooldown kicks in
+	CNErrCooldown       time.Duration
+	CNBenefitAutoClaim  bool // auto-claim limited-time model benefits on discovery
+	CNCreditsAutoClaim  bool // watchdog daily checkin / newbie credits auto-claim
+	CNMaxConcurrent     int  // per-CN-account max in-flight chat requests
+	CNKeepaliveWindow   time.Duration
+	CNKeepaliveInterval time.Duration
+	CNWatchPoll         time.Duration // watchdog poll cycle
+	CNRefreshSkew       time.Duration // refresh token this early before expiration
+	CNUpstreamTimeout   time.Duration
+
 	// RespCacheTTL enables the local identical-body response cache. Default 5m.
 	// Covers both streaming and non-streaming: identical sanitized request bodies
 	// get a cached OpenAI completion replayed in the client's protocol (OpenAI SSE,
@@ -104,6 +120,21 @@ func Get() Config {
 		ForceThinking:            envBool("FORCE_THINKING", false),
 		SSEIdleTimeout:           envDuration("SSE_IDLE_TIMEOUT", 600*time.Second),
 		RespCacheTTL:             envDuration("RESP_CACHE_TTL", 5*time.Minute),
+
+		CNEnabled:           envBool("CN_ENABLED", true),
+		CNAuthDir:           envOr("CN_AUTH_DIR", "./auths"),
+		CNDefaultModel:      envOr("CN_DEFAULT_MODEL", "snap-chat"),
+		CNSoftCooldown:      envDuration("CN_SOFT_COOLDOWN", 60*time.Second),
+		CNErrThreshold:      envInt("CN_ERR_THRESHOLD", 3),
+		CNErrCooldown:       envDuration("CN_ERR_COOLDOWN", 10*time.Minute),
+		CNBenefitAutoClaim:  envBool("CN_BENEFIT_AUTO_CLAIM", true),
+		CNCreditsAutoClaim:  envBool("CN_CREDITS_AUTO_CLAIM", true),
+		CNMaxConcurrent:     envInt("CN_MAX_CONCURRENT", 5),
+		CNKeepaliveWindow:   envDuration("CN_KEEPALIVE_WINDOW", 10*time.Minute),
+		CNKeepaliveInterval: envDuration("CN_KEEPALIVE_INTERVAL", 15*time.Minute),
+		CNWatchPoll:         envDuration("CN_WATCH_POLL", 30*time.Minute),
+		CNRefreshSkew:       envDuration("CN_REFRESH_SKEW", 30*time.Minute),
+		CNUpstreamTimeout:   envDuration("CN_UPSTREAM_TIMEOUT", 120*time.Second),
 	}
 	if cfg.PublicURL == "" {
 		cfg.PublicURL = "http://localhost:" + cfg.Port

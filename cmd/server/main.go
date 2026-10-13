@@ -13,6 +13,7 @@ import (
 
 	"go-codearts/internal/api"
 	"go-codearts/internal/auth"
+	"go-codearts/internal/cnwatch"
 	"go-codearts/internal/config"
 	"go-codearts/internal/proxypool"
 	"go-codearts/internal/store"
@@ -37,6 +38,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	apiSrv.StartQuotaSync(ctx)
+
+	// CN watchdog：导入国内码道登录产物并启动后台
+	// 签到 / 福利 / token 刷新 / 保活心跳循环。
+	// ImportCNAuthDir 对目录不存在返回 (0, nil)，无需额外判错。
+	if cfg.CNEnabled {
+		if n, err := db.ImportCNAuthDir(cfg.CNAuthDir); err != nil {
+			log.Printf("cn auth import: %v", err)
+		} else if n > 0 {
+			log.Printf("cn auth import: %d account(s) from %s", n, cfg.CNAuthDir)
+		}
+		go cnwatch.New(db, cfg).Run(ctx)
+	}
 
 	// Live-reload .env + accounts.json without restart (task #7).
 	// envPath="" falls back to "./.env" in config.ReloadEnv.

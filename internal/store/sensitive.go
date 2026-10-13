@@ -2,7 +2,7 @@ package store
 
 import "strings"
 
-var sensitiveMetadataKeys = []string{"user_token", "access_token", "refresh_token"}
+var sensitiveMetadataKeys = []string{"user_token", "access_token", "refresh_token", "cn_code_verifier"}
 
 func isEncrypted(value string) bool {
 	return strings.HasPrefix(value, "enc:")
@@ -12,7 +12,8 @@ func (db *DB) sensitiveNeedsMigration(a *Account) bool {
 	if a == nil {
 		return false
 	}
-	if (a.Password != "" && !isEncrypted(a.Password)) || (a.RefreshToken != "" && !isEncrypted(a.RefreshToken)) {
+	if (a.Password != "" && !isEncrypted(a.Password)) || (a.RefreshToken != "" && !isEncrypted(a.RefreshToken)) ||
+		(a.AccessToken != "" && !isEncrypted(a.AccessToken)) {
 		return true
 	}
 	if a.Credentials != nil {
@@ -43,6 +44,9 @@ func (db *DB) decryptSensitive(a *Account) error {
 		return err
 	}
 	if a.RefreshToken, err = db.fieldCipher.decrypt(a.RefreshToken); err != nil {
+		return err
+	}
+	if a.AccessToken, err = db.fieldCipher.decrypt(a.AccessToken); err != nil {
 		return err
 	}
 	if a.Credentials != nil {
@@ -78,6 +82,7 @@ func (db *DB) encryptSensitive(a *Account) {
 	}
 	a.Password = db.fieldCipher.encrypt(a.Password)
 	a.RefreshToken = db.fieldCipher.encrypt(a.RefreshToken)
+	a.AccessToken = db.fieldCipher.encrypt(a.AccessToken)
 	if a.Credentials != nil {
 		c := a.Credentials
 		c.AccessKeyID = db.fieldCipher.encrypt(c.AccessKeyID)

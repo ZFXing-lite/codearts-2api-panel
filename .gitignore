@@ -1,6 +1,7 @@
-.env
-bin/
-data/
 *.db
 *.exe
 *.log
+.env
+auths/
+bin/
+data/
