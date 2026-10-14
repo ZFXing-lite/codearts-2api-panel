@@ -161,5 +161,8 @@ func (db *DB) upsertCNAuth(a *cnAuth) (bool, error) {
 		}
 	}
 	acc.Metadata["cn_imported_at"] = time.Now().Format(time.RFC3339)
+	// 重新导入（cnlogin 再登录）视为凭证已续命，一并摘掉 relogin/错误状态
+	delete(acc.Metadata, "cn_needs_relogin")
+	acc.LastError = ""
 	return true, db.Upsert(acc)
 }

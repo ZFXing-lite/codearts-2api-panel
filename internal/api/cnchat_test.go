@@ -242,7 +242,7 @@ func TestCNChatNeedsReloginSkipped(t *testing.T) {
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"/v1/chat/completions", strings.NewReader(
 			`{"model":"snap-chat","messages":[{"role":"user","content":"hi"}]}`))
-	committed, retry := s.handleCNChat(context.Background(), rec, req,
+	committed, retry, _, _ := s.handleCNChat(context.Background(), rec, req,
 		[]byte(`{"model":"snap-chat","messages":[{"role":"user","content":"hi"}]}`),
 		acc, false, protoChat, "snap-chat")
 	if committed || !retry {

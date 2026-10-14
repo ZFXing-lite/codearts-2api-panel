@@ -1057,15 +1057,22 @@ func (s *Server) sweepIdleSessionResp(idleTTL time.Duration) int {
 }
 
 func (s *Server) rotateAfterFor(acc *store.Account) int {
-	if s == nil || !s.cfg.RotateByGate {
+	if s == nil {
 		return accountSSERotateAfter
 	}
-	ready, dep := accountSSERotateAfterReady, accountSSERotateAfterDepleted
-	if s.cfg.RotateAfterReady > 0 {
-		ready = s.cfg.RotateAfterReady
+	// 读 cfg 也持同一把 sessionBusyMu（写侧 ApplyReloadable 持锁），
+	// 防止热 reload 期间 rotateAfterFor 读到混合状态。
+	s.sessionBusyMu.Lock()
+	byGate, ready, dep := s.cfg.RotateByGate, s.cfg.RotateAfterReady, s.cfg.RotateAfterDepleted
+	s.sessionBusyMu.Unlock()
+	if !byGate {
+		return accountSSERotateAfter
 	}
-	if s.cfg.RotateAfterDepleted > 0 {
-		dep = s.cfg.RotateAfterDepleted
+	if ready <= 0 {
+		ready = accountSSERotateAfterReady
+	}
+	if dep <= 0 {
+		dep = accountSSERotateAfterDepleted
 	}
 	if acc != nil && acc.Depleted() {
 		return dep

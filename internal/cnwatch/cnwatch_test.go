@@ -14,8 +14,8 @@ import (
 
 // fakeClient 记录调用并可编程返回错误。
 type fakeClient struct {
-	refreshErr  error
-	refreshRes  *cnup.TokenResponse
+	refreshErr   error
+	refreshRes   *cnup.TokenResponse
 	refreshCalls int
 	checkinCalls int
 	claimCalls   int

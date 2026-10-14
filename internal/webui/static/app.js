@@ -805,7 +805,7 @@ function renderAccounts() {
       const healthCls = a.circuit === 1 ? "health-circuit" : (a.call_gate === "ready" ? "health-ready" : (a.call_gate === "quota_exhausted" ? "health-depleted" : ""));
       return `<tr class="${healthCls}">
         <td class="col-check"><input type="checkbox" class="row-check" data-id="${esc(a.id)}" ${checked}></td>
-        <td class="col-email"><div class="email" title="${esc(a.email)}">${esc(a.email)}</div>${err}</td>
+        <td class="col-email"><div class="email" title="${esc(a.email)}">${esc(a.email)}${a.channel === "cn" ? ' <span class="badge cn">CN</span>' : ""}</div>${err}</td>
         <td class="col-gate">${badge(a.call_gate || (a.disabled ? "disabled" : "unknown"))}</td>
         <td class="col-pkg nowrap">${esc(q.package_name || "—")}</td>
         <td class="col-period"><div>${esc(period)}</div>${ri ? `<div class="quota-hint ${ri.cls}" title="${esc(ri.title)}">${esc(ri.txt)}</div>` : ""}</td>
@@ -853,7 +853,7 @@ function renderAccounts() {
       const riMini = resetInfo(q);
       const healthCls = a.circuit === 1 ? "health-circuit" : (a.call_gate === "ready" ? "health-ready" : (a.call_gate === "quota_exhausted" ? "health-depleted" : ""));
       return `<tr class="${healthCls}">
-        <td class="mini-email" title="${esc(a.email)}">${esc(a.email)}</td>
+        <td class="mini-email" title="${esc(a.email)}">${esc(a.email)}${a.channel === "cn" ? ' <span class="badge cn">CN</span>' : ""}</td>
         <td class="mini-models" title="${esc(models)}">${esc(models.length > 30 ? models.slice(0, 28) + "…" : models)}</td>
         <td class="mini-num">${esc(inTok)}</td>
         <td class="mini-num">${esc(outTok)}</td>

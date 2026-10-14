@@ -1,0 +1,14 @@
+# 不烘焙进镜像的敏感/开发期产物
+.env
+.env.*
+auths/
+data/
+*.db
+.git/
+.env.bak
+**/accounts.json
+**/accounts.txt
+**/refresh_key*
+*.pem
+*.key
+README*.local.md

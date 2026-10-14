@@ -631,6 +631,16 @@ select.acct-proxy {
 .bo { background: rgba(210, 153, 34, 0.12); color: var(--orange); }
 .br { background: rgba(248, 81, 73, 0.12); color: var(--red); }
 .bb { background: rgba(78, 168, 255, 0.12); color: var(--accent); }
+/* CN 渠道徽标：橙色底配小字，一眼区分国内码道 vs 国际版 */
+.badge.cn {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  vertical-align: 1px;
+  background: rgba(210, 153, 34, 0.18);
+  color: #e2a944;
+  border: 1px solid rgba(210, 153, 34, 0.35);
+}
 .live-badge {
   display: inline-flex;
   align-items: center;

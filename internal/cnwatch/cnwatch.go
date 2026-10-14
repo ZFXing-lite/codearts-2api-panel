@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"go-codearts/internal/cnup"
@@ -23,13 +24,13 @@ import (
 
 // Metadata 键（账号 Account.Metadata）。
 const (
-	mdClientID       = "client_id"         // OAuth client_id（兼容旧导入）
-	mdClientIDLegacy = "cn_client_id"      // store/cnimport 写入的键
-	mdCodeVerifier   = "cn_code_verifier"  // PKCE verifier（刷新时必传）
+	mdClientID       = "client_id"           // OAuth client_id（兼容旧导入）
+	mdClientIDLegacy = "cn_client_id"        // store/cnimport 写入的键
+	mdCodeVerifier   = "cn_code_verifier"    // PKCE verifier（刷新时必传）
 	mdDPoPKey        = "cn_dpop_private_key" // DPoPPrivateJWK 的 JSON 序列化
-	mdNeedsRelogin   = "cn_needs_relogin"  // refresh_token 终态失效标记
-	mdLastActive     = "cn_last_active"    // 最近一次 chat 活动时间（RFC3339）
-	mdLastKeepalive  = "cn_last_keepalive" // 最近一次成功/尝试心跳时间
+	mdNeedsRelogin   = "cn_needs_relogin"    // refresh_token 终态失效标记
+	mdLastActive     = "cn_last_active"      // 最近一次 chat 活动时间（RFC3339）
+	mdLastKeepalive  = "cn_last_keepalive"   // 最近一次成功/尝试心跳时间
 )
 
 // Client 抽象 cnup.Client，便于测试注入假实现；*cnup.Client 天然满足。
@@ -42,10 +43,11 @@ type Client interface {
 
 // Watcher CN 账号 watchdog。
 type Watcher struct {
-	db     *store.DB
-	cfg    config.Config
-	client Client
-	now    func() time.Time // 测试可替换时钟
+	db      *store.DB
+	cfg     config.Config
+	client  Client
+	now     func() time.Time // 测试可替换时钟
+	running atomic.Bool      // Run 防重入；意外二次调用直接退出
 }
 
 // New 构造 watchdog，内部自建 cnup 客户端。
@@ -71,7 +73,13 @@ func NewWithClient(db *store.DB, cfg config.Config, client Client) *Watcher {
 }
 
 // Run 启动循环：立即扫描一次，随后每 CNWatchPoll 一次，直到 ctx 取消。
+// 不可重入：上层热重载误调两次会叠加双刷竞态。
 func (w *Watcher) Run(ctx context.Context) {
+	if !w.running.CompareAndSwap(false, true) {
+		log.Printf("cnwatch: Run called while already running, ignoring")
+		return
+	}
+	defer w.running.Store(false)
 	log.Printf("cnwatch: started poll=%s refresh_skew=%s keepalive_window=%s keepalive_interval=%s checkin=%v",
 		w.cfg.CNWatchPoll, w.cfg.CNRefreshSkew, w.cfg.CNKeepaliveWindow, w.cfg.CNKeepaliveInterval, w.cfg.CNCreditsAutoClaim)
 	w.scanOnce(ctx)
@@ -153,27 +161,46 @@ func (w *Watcher) refreshIfDue(ctx context.Context, acc *store.Account) bool {
 			log.Printf("cnwatch: %s: bad dpop jwk in metadata: %v", acc.ID, err)
 		}
 	}
+	unlock := w.db.RefreshLock(acc.ID)
+	defer unlock()
+	// 重读活账号：可能已被 cnchat inline 刷新抢先一步完成
+	freshAcc, err := w.db.Get(acc.ID)
+	if err == nil && freshAcc.RefreshToken != acc.RefreshToken {
+		log.Printf("cnwatch: %s: refresh token rotated by another path, skip", acc.ID)
+		return false // 已被另一侧刷新，放弃本次避免双轮换
+	}
 	res, err := w.client.RefreshToken(ctx, loginCfg, acc.RefreshToken, acc.Metadata[mdCodeVerifier], dpop)
 	if err != nil {
 		var expired *cnup.RefreshTokenExpiredError
 		if errors.As(err, &expired) {
 			log.Printf("cnwatch: %s: refresh token expired, needs re-login: %v", acc.ID, err)
-			acc.Metadata[mdNeedsRelogin] = "true"
-			acc.LastError = err.Error()
-			if uerr := w.db.Upsert(acc); uerr != nil {
-				log.Printf("cnwatch: %s: persist relogin mark: %v", acc.ID, uerr)
+			// Mutate 原子写入，避免 acc 已是旧快照时覆盖别处刷新的字段
+			if merr := w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+				if fresh.Metadata == nil {
+					fresh.Metadata = map[string]string{}
+				}
+				fresh.Metadata[mdNeedsRelogin] = "true"
+				fresh.LastError = err.Error()
+				return nil
+			}); merr != nil {
+				log.Printf("cnwatch: %s: persist relogin mark: %v", acc.ID, merr)
 			}
 			return true
 		}
 		log.Printf("cnwatch: %s: refresh failed (transient): %v", acc.ID, err)
 		return false
 	}
-	applyTokenResponse(acc, res)
-	if err := w.db.Upsert(acc); err != nil {
-		log.Printf("cnwatch: %s: persist refreshed token: %v", acc.ID, err)
+	// Mutate 在持锁状态下原子改活账号；快照 acc 的 TokenExpires 后续给日志用
+	var newExp time.Time
+	if merr := w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		applyTokenResponse(fresh, res)
+		newExp = fresh.TokenExpires
+		return nil
+	}); merr != nil {
+		log.Printf("cnwatch: %s: persist refreshed token: %v", acc.ID, merr)
 		return false
 	}
-	log.Printf("cnwatch: %s: token refreshed, expires=%s", acc.ID, acc.TokenExpires.Format(time.RFC3339))
+	log.Printf("cnwatch: %s: token refreshed, expires=%s", acc.ID, newExp.Format(time.RFC3339))
 	return false
 }
 

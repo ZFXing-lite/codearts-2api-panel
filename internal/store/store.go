@@ -65,12 +65,12 @@ type QuotaSnapshot struct {
 	PeriodEvidence string  `json:"period_evidence,omitempty"`
 	// Upstream-owned reset schedule: explicit upstream field or labelled estimate.
 	// omitzero (Go 1.24+) so stale snapshots don't ship "0001-01-01T00:00:00Z".
-	NextResetAt *time.Time `json:"next_reset_at,omitzero"`
+	NextResetAt *time.Time `json:"next_reset_at,omitempty"`
 	ResetSource string     `json:"reset_source,omitempty"`
 	ResetNote   string     `json:"reset_note,omitempty"`
 	// Observed reset history: upstream owns the moment, so we record counter
 	// rollbacks seen during quota refresh (used drop / budget refill).
-	LastResetAt        *time.Time `json:"last_reset_at,omitzero"`
+	LastResetAt        *time.Time `json:"last_reset_at,omitempty"`
 	ResetCount         int        `json:"reset_count,omitempty"`
 	ResetIntervalHours float64    `json:"reset_interval_hours,omitempty"`
 	FetchedAt          time.Time  `json:"fetched_at"`
@@ -353,25 +353,26 @@ func (a *Account) MarkUpstreamRejected(errMsg string, now time.Time) {
 	}
 }
 
+// hwNaiveLoc 无时区时间串按华为上游语义固定 +08:00（CST）解析——
+// 用容器/宿主机的本地时区会让 TokenExpires 错位 ±8h。
+var hwNaiveLoc = time.FixedZone("CST", 8*3600)
+
 // ParseFlexibleTime parses common Huawei time strings (shared with quota helpers).
+// 带时区的布局按原值解析；无时区的布局一律按 UTC+8（华为侧是北京时间）。
 func ParseFlexibleTime(s string) time.Time {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return time.Time{}
 	}
-	layouts := []string{
-		time.RFC3339, time.RFC3339Nano,
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
-		"2006/01/02 15:04:05",
-		"2006/01/02",
-	}
-	for _, layout := range layouts {
-		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+	zoned := []string{time.RFC3339, time.RFC3339Nano, "2006-01-02T15:04:05Z07:00"}
+	for _, layout := range zoned {
+		if t, err := time.Parse(layout, s); err == nil {
 			return t
 		}
-		if t, err := time.Parse(layout, s); err == nil {
+	}
+	naive := []string{"2006-01-02 15:04:05", "2006-01-02", "2006/01/02 15:04:05", "2006/01/02"}
+	for _, layout := range naive {
+		if t, err := time.ParseInLocation(layout, s, hwNaiveLoc); err == nil {
 			return t
 		}
 	}
@@ -383,6 +384,10 @@ type DB struct {
 	path     string
 	Accounts map[string]*Account `json:"accounts"`
 	Version  int                 `json:"version"`
+
+	// refreshLocks 按账号 ID 单飞互斥，防止 cnwatch 与 cnchat 双通道刷新
+	// 同一个账号导致 refresh token 轮换 write-last-wins 自毁。
+	refreshLocks map[string]*sync.Mutex
 
 	// Debounced write: avoids writing the entire JSON file on every Upsert.
 	// A background goroutine flushes dirty state every writeInterval.
@@ -413,6 +418,7 @@ func Open(dataDir string) (*DB, error) {
 		writeDone:     make(chan struct{}),
 		writeInterval: defaultWriteInterval,
 		fieldCipher:   fieldCipher,
+		refreshLocks:  map[string]*sync.Mutex{},
 	}
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -739,10 +745,11 @@ func (db *DB) SnapshotList() []*Account {
 	return out
 }
 
-// deepCopyAccount produces an isolated copy. Uses fast struct copy + Quota
-// pointer copy — GET handlers only modify scalar fields and Quota, so sharing
-// Maps/Slices (Metadata, UserInfo, Models) is safe and avoids JSON round-trip
-// overhead that made the dashboard slow with 100+ accounts.
+// deepCopyAccount produces an isolated copy. Scalar fields + pointer structs
+// are copied; Metadata/UserInfo/Models MUST NOT be shared with the live
+// record — cnwatch / cnchat / panel writers mutate them outside db.mu while
+// saveLocked marshals them inside the lock (concurrent map read/write =
+// process fatal).
 func deepCopyAccount(a *Account) *Account {
 	if a == nil {
 		return nil
@@ -759,6 +766,25 @@ func deepCopyAccount(a *Account) *Account {
 			c.DpopKeyPair = &dp
 		}
 		cp.Credentials = &c
+	}
+	if a.Metadata != nil {
+		md := make(map[string]string, len(a.Metadata))
+		for k, v := range a.Metadata {
+			md[k] = v
+		}
+		cp.Metadata = md
+	}
+	if a.UserInfo != nil {
+		ui := make(map[string]any, len(a.UserInfo))
+		for k, v := range a.UserInfo {
+			ui[k] = v
+		}
+		cp.UserInfo = ui
+	}
+	if a.Models != nil {
+		mdl := make([]string, len(a.Models))
+		copy(mdl, a.Models)
+		cp.Models = mdl
 	}
 	return &cp
 }
@@ -795,6 +821,55 @@ func (db *DB) rewriteAccountsTxtLocked() error {
 	}
 	return os.WriteFile(db.AccountsTxtPath(), []byte(b.String()), 0o600)
 }
+
+// RefreshLock 按账号 ID 提供单飞互斥。cnwatch（后台）与 cnchat（在线
+// inline 续期）两条刷新通道争抢同一账号时，STS 服务端对 refresh token
+// 做一次性轮换检测：先用旧 token 的一方成功，后到的一方拿到
+// "has been used"（当前分类为 RefreshTokenExpiredError 终态），会被
+// 误判成"凭证彻底失效"而永久摘除账号。持锁进入后先重读活账号，
+// refresh token 已被轮换则放弃本次刷新（已是新 token）。
+func (db *DB) RefreshLock(accountID string) func() {
+	db.mu.Lock()
+	lk, ok := db.refreshLocks[accountID]
+	if !ok {
+		lk = &sync.Mutex{}
+		if db.refreshLocks == nil {
+			db.refreshLocks = map[string]*sync.Mutex{}
+		}
+		db.refreshLocks[accountID] = lk
+	}
+	db.mu.Unlock()
+	lk.Lock()
+	return lk.Unlock
+}
+
+// Mutate 在持锁状态下对活账号应用 fn（fn 不得再发起 IO，也不得
+// 再回调 db 其他方法）。解决「Get→锁外改字段→Upsert」的多步竞态：
+// Get/Upsert 本身带锁，但中间窗口里别的写者可能已刷过同一账号。
+// fn 返回非 nil error 时写回被撤销，且不会触发 markDirty。
+func (db *DB) Mutate(id string, fn func(*Account) error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	a, ok := db.Accounts[id]
+	if !ok {
+		return errors.New("account not found")
+	}
+	if fn == nil {
+		return nil
+	}
+	// 备份轻量以便回滚（不深拷贝——fn 不允许新增指针对象的副作用）
+	bak := *a
+	if err := fn(a); err != nil {
+		db.Accounts[id] = &bak
+		return err
+	}
+	a.UpdatedAt = time.Now()
+	db.markDirtyLocked()
+	return nil
+}
+
+// markDirtyLocked 必须在持锁状态下调用（由 Mutate 使用）。
+func (db *DB) markDirtyLocked() { db.dirty = true }
 
 func (db *DB) Delete(id string) error {
 	db.mu.Lock()

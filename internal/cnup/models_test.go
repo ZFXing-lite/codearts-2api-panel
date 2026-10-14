@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 )
 
 func TestCanonicalModelKnownIndex(t *testing.T) {

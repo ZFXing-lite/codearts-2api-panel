@@ -214,6 +214,10 @@ func (s *Server) ApplyReloadable(cfg config.Config) {
 	s.cfg.KeyRPM = cfg.KeyRPM
 	s.cfg.KeyMaxInFlight = cfg.KeyMaxInFlight
 	s.sessionBusyMu.Unlock()
+	// KeyGate 是独立 mutex，不受 sessionBusyMu 保护；单独同步
+	if s.keyGate != nil {
+		s.keyGate.SetLimits(cfg.KeyRPM, cfg.KeyMaxInFlight)
+	}
 	if s.dispatchLimiter != nil {
 		s.dispatchLimiter.SetRPS(float64(cfg.HuaweiDispatchRPS))
 	}
@@ -1087,18 +1091,22 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		// CN channel (国内码道) — self-contained branch, see cnchat.go.
 		if store.NormalizeChannel(acc.Channel) == store.ChannelCN {
-			committed, cnRetry := s.handleCNChat(relayCtx, w, r, body, acc, wantStream, proto, peekModel(body))
+			committed, cnRetry, cnOK, slotFull := s.handleCNChat(relayCtx, w, r, body, acc, wantStream, proto, peekModel(body))
 			if committed {
 				releaseLease(acc.ID, acc.Depleted())
-				recordStats(wantStream, true, 0, 0, 0)
+				// 失败响应也走 committed 但必须按 ok=false 记账，别把 502 记成成功。
+				recordStats(wantStream, cnOK, 0, 0, 0)
 				return
 			}
 			endLease(acc.ID)
 			if cnRetry {
-				upstreamTries++
+				// slotFull = 本地并发槽满，换账号不算真实上游上游尝试，不消耗重试预算
+				if !slotFull {
+					upstreamTries++
+				}
 				continue
 			}
-			recordStats(wantStream, false, 0, 0, 0)
+			recordStats(wantStream, cnOK, 0, 0, 0)
 			return
 		}
 		creds := s.accountOAuthCreds(acc)

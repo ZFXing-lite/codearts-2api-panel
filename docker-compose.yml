@@ -14,6 +14,9 @@ services:
       # vim :wq) leaves the container reading the stale inode. Mounting the
       # parent directory instead makes lookups path-based, so rename survives.
       - CODEARTS_ENV_FILE=/app/host/.env
+      # 国内码道：CN 账号的 auths/*.json 默认在宿主机 ./auths（同仓库根）。
+      # 挂载到容器 /app/host/auths；启用 CN 时把此处作为 import 目录。
+      - CN_AUTH_DIR=/app/host/auths
     volumes:
       - codearts_data:/data
       - ./:/app/host:ro

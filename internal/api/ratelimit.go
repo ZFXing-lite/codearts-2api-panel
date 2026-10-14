@@ -64,6 +64,24 @@ type KeyGate struct {
 	inflight    map[string]int
 }
 
+// SetLimits 热重载新限额；原 KeyGate 在 New() 凝固后永不刷新导致
+// ApplyReloadable 改 .env KeyRPM/KeyMaxInFlight 看似生效实则跑旧值。
+func (kg *KeyGate) SetLimits(rpm, maxInFlight int) {
+	if kg == nil {
+		return
+	}
+	kg.mu.Lock()
+	if rpm < 0 {
+		rpm = 0
+	}
+	if maxInFlight < 0 {
+		maxInFlight = 0
+	}
+	kg.rpmLimit = rpm
+	kg.maxInFlight = maxInFlight
+	kg.mu.Unlock()
+}
+
 func newKeyGate(rpm, maxInFlight int) *KeyGate {
 	if rpm < 0 {
 		rpm = 0

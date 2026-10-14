@@ -70,7 +70,7 @@ go run ./cmd/cnlogin
 | `PORT` | 监听端口 | `29137` |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 面板管理员账号 | `admin` / `admin123` |
 | `API_KEY` | 对外 API 鉴权 Key（留空则开放） | 空 |
-| `DATA_DIR` | 数据目录 | `/data` |
+| `DATA_DIR` | 数据目录 | Docker=`/data`（compose 挂载卷）/ 裸机=`./data` |
 | `REG_AREA_CODE` | 国际渠道注册区域代码 | `OM` |
 | `CN_ENABLED` | 启用国内码道渠道 | `true` |
 | `CN_AUTH_DIR` | CN 凭证目录 | `./auths` |

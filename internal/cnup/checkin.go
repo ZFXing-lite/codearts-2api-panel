@@ -145,16 +145,36 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	return out, nil
 }
 
+// hwCST 华为上游无时区时间串统一按中国标准时间（UTC+8）解析。
+var hwCST = time.FixedZone("CST", 8*3600)
+
 func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, now time.Time) CreditClaimResult {
 	res := CreditClaimResult{CampaignID: campaign.ID, Title: campaign.Title, Status: strings.TrimSpace(campaign.Status), OK: true}
 	if res.Title == "" {
 		res.Title = fmt.Sprintf("积分活动 %d", campaign.ID)
 	}
-	if end, err := time.Parse(time.RFC3339Nano, campaign.Extra.EndTime); err == nil && !now.Before(end) {
+	// 华为侧时间字符串可能无时区，统一走 +08:00 CST 解析，
+	// 避免容器/UTC 部署下窗口错位 ±8h 导致漏签。
+	parseTime := func(s string) time.Time {
+		if s == "" {
+			return time.Time{}
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return t
+		}
+		if t, err := time.ParseInLocation("2006-01-02T15:04:05.999", s, hwCST); err == nil {
+			return t
+		}
+		if t, err := time.ParseInLocation("2006-01-02T15:04:05", s, hwCST); err == nil {
+			return t
+		}
+		return time.Time{}
+	}
+	if end := parseTime(campaign.Extra.EndTime); !end.IsZero() && !now.Before(end) {
 		res.Message = "活动已结束"
 		return res
 	}
-	if start, err := time.Parse(time.RFC3339Nano, campaign.Extra.StartTime); err == nil && now.Before(start) {
+	if start := parseTime(campaign.Extra.StartTime); !start.IsZero() && now.Before(start) {
 		res.Message = "活动尚未开始"
 		return res
 	}

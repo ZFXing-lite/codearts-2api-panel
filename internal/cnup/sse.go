@@ -4,7 +4,7 @@
 //   - onAnswer:  {"text":"增量","custom_extra_info":...}
 //   - reasoning / thinking: 思考链增量
 //   - done:      {"error_code":"0","error_msg":"","related_question_answer":[...],"response_message_id":"..."}
-//                 related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
+//     related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
 //   - error / heartbeat 等
 //
 // 另：部分帧可能直接给出 structured QA 对象 {question,options,answer}（无 text 字段）。
@@ -382,6 +382,22 @@ func parseQAJSON(s string) (map[string]any, bool) {
 	return obj, true
 }
 
+// commonPrefixLen 返回双字符串公共前缀字节数。用于快照帧 Reset 后对
+// 新旧全文做正确 diff，避免把"重置后的新串"切成旧串后缀发出去。
+func commonPrefixLen(a, b string) int {
+	n := min(len(a), len(b))
+	i := 0
+	// 按字节走，但必须确保终点落在 UTF-8 rune 边界，否则可能切开多字节
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	// 回退到最后一个 rune 起点
+	for i > 0 && (i < len(a)) && (a[i]&0xC0) == 0x80 {
+		i--
+	}
+	return i
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -577,6 +593,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
 			beforeContent, beforeReason := content.Len(), reason.Len()
+			prevContent := content.String() // 快照帧可能 Reset 后重写，留存旧全文以对齐 diff
 			applyEvent(&content, &reason, &finish, &upErr, ev, data)
 			if upErr != nil {
 				if werr := writeErr(upErr.Error()); werr != nil {
@@ -595,8 +612,16 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			if role, ok := nativeDelta["role"].(string); ok && role != "" {
 				delta["role"] = role
 			}
-			if content.Len() > beforeContent {
-				delta["content"] = content.String()[beforeContent:]
+			newContent := content.String()
+			if common := commonPrefixLen(prevContent, newContent); common < beforeContent {
+				// 快照帧 Reset 重写且非前缀扩展：append-only 客户端无法回退，
+				// 只能发公共前缀后的新尾 + 标记位提醒客户端做整段替换。
+				if c := newContent[common:]; c != "" {
+					delta["content"] = c
+					delta["_reset"] = true // non-standard hint，客户端可选忽略
+				}
+			} else if content.Len() > beforeContent {
+				delta["content"] = newContent[beforeContent:]
 			}
 			if reason.Len() > beforeReason {
 				delta["reasoning_content"] = reason.String()[beforeReason:]

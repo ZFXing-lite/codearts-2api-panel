@@ -21,24 +21,28 @@ import (
 )
 
 // handleCNChat serves one chat attempt against a CN-channel account.
-// Returns (committed, retry): committed=true means a response was written
-// (success or final error) and the caller must end the request; retry=true
-// means a transient/pool-level failure with nothing written — rotate account.
-func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, acc *store.Account, wantStream bool, proto clientProto, model string) (bool, bool) {
+// Returns (committed, retry, ok):
+//   - committed=true: response written（成功或最终错误），调用方必须收笔。
+//     ok 告诉调用方这一次算真成功还是失败，用于 recordStats。
+//   - retry=true: 瞬态失败，可换账号再试；但是槽位满不消耗重试预算
+//     （slotFull 由 CommittedTagSlotFull 区分）。
+//   - retry=false & committed=false: 本地失败（如 body 错误已 writeErr）。
+func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, acc *store.Account, wantStream bool, proto clientProto, model string) (committed, retry, ok, slotFull bool) {
 	release := s.cnAcquire(acc.ID)
 	if release == nil {
-		return false, true // per-account slots full — pick another account
+		// 本地并发槽满 ≠ 上游失败，不计入重试预算（由 slotFull 标记）
+		return false, true, false, true
 	}
 	defer release()
 
 	if acc.Metadata["cn_needs_relogin"] == "true" {
-		return false, true
+		return false, true, false, false
 	}
 	// Proactive refresh inside the skew window, same contract as cnwatch.
 	if !acc.TokenExpires.IsZero() && time.Until(acc.TokenExpires) < s.cfg.CNRefreshSkew {
 		if err := s.cnRefresh(acc); err != nil {
 			if s.cnMarkReloginErr(acc, err) {
-				return false, true
+				return false, true, false, false
 			}
 			log.Printf("cn chat refresh rid=%s account=%s err=%v", reqIDFromRequest(r), acc.ID, err)
 			// fall through with the old token; upstream will 401 if truly dead
@@ -48,7 +52,10 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 	chatID := cnChatID(r, body, acc)
 	msgs, opts, err := cnConvertBody(body)
 	if err != nil {
-		return false, true // malformed shape — rotate; body-level 400s already handled upstream
+		// 请求体级错误（缺 messages 等）轮转到任何账号都一样失败，
+		// 直接向客户端吐 400，不消耗轮转配额。
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("cn body: %v", err))
+		return true, false, false, false
 	}
 	benefit := cnup.IsBenefitModel(acc.UserID, model)
 	traceID, _ := cnup.RandomHex(16)
@@ -61,41 +68,42 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 	rc, err := s.cnUpstream().ChatStreamWithOptions(ctx, chatID, msgs, traceID, cred, acc.Email, model, opts, benefit)
 	if err != nil {
 		if s.cnMarkReloginErr(acc, err) || cnIsAuthErr(err) {
-			return false, true
+			return false, true, false, false
 		}
 		if isTransientUpstreamErr(err) || errors.Is(err, context.DeadlineExceeded) {
-			return false, true
+			return false, true, false, false
 		}
 		if ctx.Err() != nil {
-			return true, false // client gone; nothing sensible left to write
+			return true, false, false, false // client gone; nothing sensible left to write
 		}
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cn upstream: %v", err))
-		return true, false
+		return true, false, false, false
 	}
 	defer rc.Close()
 
 	s.cnTouchActive(acc)
 
 	if wantStream && proto == protoChat {
-		if err := cnup.StreamCapture(w, rc, model, func(*cnup.RawCompletion) {}); err != nil {
-			log.Printf("cn chat stream rid=%s account=%s mid-stream err=%v", reqIDFromRequest(r), acc.ID, err)
+		serr := cnup.StreamCapture(w, rc, model, func(*cnup.RawCompletion) {})
+		if serr != nil {
+			log.Printf("cn chat stream rid=%s account=%s mid-stream err=%v", reqIDFromRequest(r), acc.ID, serr)
 		}
-		return true, false
+		return true, false, serr == nil, false
 	}
 
 	agg, err := cnup.Aggregate(rc, model)
 	if err != nil {
 		if s.cnMarkReloginErr(acc, err) {
-			return false, true
+			return false, true, false, false
 		}
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cn upstream aggregate: %v", err))
-		return true, false
+		return true, false, false, false
 	}
 	raw, _ := json.Marshal(agg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(encodeProtoBody(proto, raw, &ssePin{Proto: proto, Model: model}))
-	return true, false
+	return true, false, true, false
 }
 
 // rewriteBodyModel 复写请求体顶层 model 字段（剥渠道前缀用）。
@@ -242,6 +250,12 @@ func cnConvertBody(body []byte) ([]cnup.ChatMessage, cnup.ChatOptions, error) {
 // cnRefresh runs one inline token refresh when the chat path notices the
 // access token inside the skew window. Mirrors cnwatch's write-back contract.
 func (s *Server) cnRefresh(acc *store.Account) error {
+	unlock := s.db.RefreshLock(acc.ID)
+	defer unlock()
+	// cnwatch 可能已抢先完成本轮刷新，重读活账号比对 refresh token
+	if fresh, err := s.db.Get(acc.ID); err == nil && fresh != nil && fresh.RefreshToken != acc.RefreshToken {
+		return nil // 已被另一侧刷新，放弃本次避免双轮换自毁
+	}
 	loginCfg := cnup.DefaultLoginConfig()
 	if v := acc.Metadata["cn_client_id"]; v != "" {
 		loginCfg.ClientID = v
@@ -257,12 +271,11 @@ func (s *Server) cnRefresh(acc *store.Account) error {
 	if err != nil {
 		return err
 	}
-	fresh, err := s.db.Get(acc.ID)
-	if err != nil || fresh == nil {
-		return err
-	}
-	applyCNTokenResponse(fresh, tr)
-	return s.db.Upsert(fresh)
+	// 用 Mutate 原子改活账号：Get→改→Upsert 两步之间可能与其他写者竞争。
+	return s.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		applyCNTokenResponse(fresh, tr)
+		return nil
+	})
 }
 
 func applyCNTokenResponse(acc *store.Account, tr *cnup.TokenResponse) {
@@ -283,12 +296,19 @@ func applyCNTokenResponse(acc *store.Account, tr *cnup.TokenResponse) {
 	} else if tr.Credential.ExpiresAt != "" {
 		acc.TokenExpires = store.ParseFlexibleTime(tr.Credential.ExpiresAt)
 	}
-	if acc.Credentials != nil && acc.AccessToken != "" {
-		acc.Credentials.SecurityToken = acc.AccessToken
-		if tr.Credentials.AccessKeyID != "" {
-			acc.Credentials.AccessKeyID = tr.Credentials.AccessKeyID
-			acc.Credentials.SecretAccessKey = tr.Credentials.SecretAccessKey
+	// AK/SK 也一并回写（原逻辑要求 Credentials 非 nil 才更新，
+	// 刷新时会有新 AK/SK 上来但永远写不进去——cnwatch 对齐版本）
+	if tr.Credentials.AccessKeyID != "" && tr.Credentials.SecretAccessKey != "" {
+		acc.Credentials = &store.Credentials{
+			AccessKeyID:     tr.Credentials.AccessKeyID,
+			SecretAccessKey: tr.Credentials.SecretAccessKey,
+			SecurityToken:   acc.AccessToken,
+			Expiration:      acc.TokenExpires,
+			AuthMode:        "oauth_sts",
 		}
+	} else if acc.Credentials != nil && acc.AccessToken != "" {
+		acc.Credentials.SecurityToken = acc.AccessToken
+		acc.Credentials.Expiration = acc.TokenExpires
 	}
 }
 
@@ -299,13 +319,15 @@ func (s *Server) cnMarkReloginErr(acc *store.Account, err error) bool {
 	if !errors.As(err, &rte) {
 		return false
 	}
-	if fresh, gerr := s.db.Get(acc.ID); gerr == nil && fresh != nil {
+	if merr := s.db.Mutate(acc.ID, func(fresh *store.Account) error {
 		if fresh.Metadata == nil {
 			fresh.Metadata = map[string]string{}
 		}
 		fresh.Metadata["cn_needs_relogin"] = "true"
 		fresh.LastError = "cn refresh token expired; re-login via cnlogin"
-		_ = s.db.Upsert(fresh)
+		return nil
+	}); merr != nil {
+		log.Printf("cn mark relogin account=%s err=%v", acc.ID, merr)
 	}
 	return true
 }
@@ -353,13 +375,11 @@ func filterAccountsByRealm(accounts []*store.Account, realm string) []*store.Acc
 
 // cnTouchActive records chat activity for cnwatch keepalive gating.
 func (s *Server) cnTouchActive(acc *store.Account) {
-	fresh, err := s.db.Get(acc.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if fresh.Metadata == nil {
-		fresh.Metadata = map[string]string{}
-	}
-	fresh.Metadata["cn_last_active"] = time.Now().Format(time.RFC3339)
-	_ = s.db.Upsert(fresh)
+	_ = s.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata["cn_last_active"] = time.Now().Format(time.RFC3339)
+		return nil
+	})
 }
