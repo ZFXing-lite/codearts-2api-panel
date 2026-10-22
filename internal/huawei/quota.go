@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go-codearts/internal/kit"
 )
 
 // SubscriptionInfo is the CodeArts CLI /snap-manager/v1/statistics/plugin payload.
@@ -112,11 +114,8 @@ func FetchSubscription(ctx context.Context, baseURL string, creds *OAuthTokenRes
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
-		msg := string(body)
-		if len(msg) > 300 {
-			msg = msg[:300]
-		}
-		return nil, fmt.Errorf("subscription %d: %s", resp.StatusCode, msg)
+		// 先脱敏再按字符边界截断：错误信息会进面板与日志。
+		return nil, fmt.Errorf("subscription %d: %s", resp.StatusCode, kit.Snippet(string(body), 300))
 	}
 	info := &SubscriptionInfo{Raw: append(json.RawMessage(nil), body...)}
 	if err := json.Unmarshal(body, info); err != nil {

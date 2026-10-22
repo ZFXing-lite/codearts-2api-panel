@@ -60,8 +60,11 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 					t.Errorf("unexpected campaign: %v", body)
 				}
 				if r.URL.Path == EpCreditClaim {
+					// 幂等键必须绑定 账号 + 活动 + 上海日历日，否则上游识别不出
+					// 是同一次领取，重试会重复 claim。
 					key, _ := body["idempotentKey"].(string)
-					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_1_") {
+					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_") ||
+						!strings.HasSuffix(key, "_1_"+time.Now().In(hwCST).Format("2006-01-02")) {
 						t.Errorf("wrong claim body: %v", body)
 					}
 				}

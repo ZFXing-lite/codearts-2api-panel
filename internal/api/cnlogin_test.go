@@ -161,8 +161,8 @@ func TestCNLoginPasteCallback(t *testing.T) {
 	if out["status"] != "continue" {
 		t.Fatalf("status=%v want continue", out["status"])
 	}
-	if !sess.TicketFallback || sess.Secret != "s2" {
-		t.Fatalf("fallback=%v secret=%q", sess.TicketFallback, sess.Secret)
+	if secret, fallback := sess.pollSecret(); !fallback || secret != "s2" {
+		t.Fatalf("fallback=%v secret=%q", fallback, secret)
 	}
 }
 

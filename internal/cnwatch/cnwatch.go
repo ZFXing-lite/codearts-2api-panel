@@ -20,6 +20,7 @@ import (
 
 	"go-codearts/internal/cnup"
 	"go-codearts/internal/config"
+	"go-codearts/internal/kit"
 	"go-codearts/internal/store"
 )
 
@@ -59,6 +60,7 @@ type Client interface {
 	Checkin(ctx context.Context, cred cnup.SignCredential) (cnup.CheckinResult, error)
 	ClaimBenefit(cred cnup.SignCredential) error
 	ChatStream(ctx context.Context, chatID string, messages []cnup.ChatMessage, traceID string, cred cnup.SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error)
+	FetchModels(acct *cnup.Account) ([]cnup.ModelInfo, error)
 }
 
 // Watcher CN 账号 watchdog。
@@ -158,7 +160,41 @@ func (w *Watcher) watchAccount(ctx context.Context, id string) {
 	if w.cfg.CNBenefitAutoClaim {
 		w.claimBenefit(acc, cred)
 	}
+	w.refreshCatalog(acc)
 	w.keepalive(ctx, acc, cred)
+}
+
+// refreshCatalog 在网关进程内做模型目录发现。
+//
+// 三路发现逻辑（OpenAI 兼容端点 / agent-center / 快照）在 cnup 里都写好了，
+// 但唯一调用者是独立的 cmd/cnmodels CLI —— 网关自己从不刷新，于是
+// catalog 恒空：/v1/models 的 cn: 模型为空、面板模型页 count=0、
+// IsBenefitModel 永远回落三个冷启动种子（新福利模型漏带 maas_type 会 404）。
+// 按 CatalogTTL 节流，失败下一轮再试。
+func (w *Watcher) refreshCatalog(acc *store.Account) {
+	if acc == nil || acc.UserID == "" {
+		return
+	}
+	if !cnup.AccountCatalogStale(acc.UserID) {
+		return
+	}
+	acct := &cnup.Account{
+		UserID:         acc.UserID,
+		CloudDragonTok: acc.AccessToken,
+	}
+	if acc.Credentials != nil {
+		acct.AccessKeyID = acc.Credentials.AccessKeyID
+		acct.SecretAccessKey = acc.Credentials.SecretAccessKey
+		if acct.CloudDragonTok == "" {
+			acct.CloudDragonTok = acc.Credentials.SecurityToken
+		}
+	}
+	ids, err := w.client.FetchModels(acct)
+	if err != nil {
+		log.Printf("cnwatch: %s: catalog refresh failed: %v", acc.ID, err)
+		return
+	}
+	log.Printf("cnwatch: %s: catalog refreshed (%d models)", acc.ID, len(ids))
 }
 
 // refreshIfDue 距 TokenExpires < CNRefreshSkew 时刷新并写回。
@@ -250,6 +286,12 @@ func applyTokenResponse(acc *store.Account, res *cnup.TokenResponse) {
 			Expiration:      acc.TokenExpires,
 			AuthMode:        "oauth_sts",
 		}
+	} else if acc.Credentials != nil {
+		// STS 的 AK/SK 与 security_token 是成对的。上游只轮换 token、不重发
+		// AK/SK 时，必须把签名用的 security_token 一并更新，否则账号会被
+		// 调度器反复选中、反复 401。
+		acc.Credentials.SecurityToken = acc.AccessToken
+		acc.Credentials.Expiration = acc.TokenExpires
 	}
 }
 
@@ -277,7 +319,9 @@ func (w *Watcher) checkin(ctx context.Context, acc *store.Account, cred cnup.Sig
 		}
 		fresh.Metadata[mdCheckinAt] = w.now().Format(time.RFC3339)
 		fresh.Metadata[mdCheckinMsg] = truncate(msg, 200)
-		if err == nil {
+		// 只有真正拿到活动才算"今日已签"。上游 200 但活动列表为空
+		// （灰度/配置延迟/部分故障）不等于签过，否则当天漏签且无法补。
+		if err == nil && res.Matched > 0 {
 			fresh.Metadata[mdCheckinDate] = today
 			fresh.Metadata[mdCheckinCredits] = strconv.FormatFloat(credits, 'f', -1, 64)
 		}
@@ -285,12 +329,10 @@ func (w *Watcher) checkin(ctx context.Context, acc *store.Account, cred cnup.Sig
 	})
 }
 
-// truncate 截断过长文案（Metadata 只存摘要）。
+// truncate 截断过长文案（Metadata 只存摘要）。按字符边界切，
+// 否则中文错误信息写进 accounts.json 就是半个字符的乱码。
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
+	return kit.TruncateUTF8(s, n)
 }
 
 // claimBenefit 限时福利领取（cnup 内置幂等便利方法）。
@@ -333,16 +375,16 @@ func (w *Watcher) keepalive(ctx context.Context, acc *store.Account, cred cnup.S
 		_ = rc.Close()
 		log.Printf("cnwatch: %s: keepalive ping sent (chat=%s)", acc.ID, chatID)
 	}
-	// 重新取快照再写，避免覆盖并发期间其他写者的字段。
-	fresh, ferr := w.db.SnapshotAccount(acc.ID)
-	if ferr != nil {
-		return
-	}
-	if fresh.Metadata == nil {
-		fresh.Metadata = map[string]string{}
-	}
-	fresh.Metadata[mdLastKeepalive] = now.Format(time.RFC3339)
-	if uerr := w.db.Upsert(fresh); uerr != nil {
+	// 只能 Mutate 单个字段：Upsert 是整对象替换，会把并发期间 cnchat 刚刷新
+	// 出来的 AccessToken/RefreshToken 写回旧值。refresh token 一次性轮换，
+	// 旧值回写后下一次刷新会被 STS 判"已使用"，账号直接永久失效。
+	if uerr := w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata[mdLastKeepalive] = now.Format(time.RFC3339)
+		return nil
+	}); uerr != nil {
 		log.Printf("cnwatch: %s: persist keepalive ts: %v", acc.ID, uerr)
 	}
 }

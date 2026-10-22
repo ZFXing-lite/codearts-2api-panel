@@ -21,6 +21,14 @@ type fakeClient struct {
 	claimCalls   int
 	chatCalls    int
 	chatErr      error
+	modelCalls   int
+	modelRes     []cnup.ModelInfo
+	modelErr     error
+}
+
+func (f *fakeClient) FetchModels(*cnup.Account) ([]cnup.ModelInfo, error) {
+	f.modelCalls++
+	return f.modelRes, f.modelErr
 }
 
 func (f *fakeClient) RefreshToken(context.Context, cnup.LoginConfig, string, string, cnup.DPoPPrivateJWK) (*cnup.TokenResponse, error) {

@@ -177,10 +177,14 @@ func (cb *CircuitBreaker) RecordFailureWithType(accID string, errType string, co
 	s.consecutiveFailures++
 	s.errorType = errType
 
-	if cooldownOverride > 0 {
-		s.customRecovery = cooldownOverride
-	} else {
-		s.customRecovery = cooldownForErrorType(errType)
+	// 取较长者，不要覆盖：额度耗尽（6h）的账号随后挨一次 429（60s）时，
+	// 覆盖会把 6 小时硬封禁降级成 1 分钟，于是继续拿空额度账号撞上游。
+	want := cooldownOverride
+	if want <= 0 {
+		want = cooldownForErrorType(errType)
+	}
+	if want > s.customRecovery {
+		s.customRecovery = want
 	}
 
 	openedNow := false

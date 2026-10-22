@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestCanonicalModelKnownIndex(t *testing.T) {
@@ -263,5 +264,32 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 	mu.Unlock()
 	if gotClaims != 1 {
 		t.Fatalf("关闭自动领取后不应再提交 claim，claims=%d", gotClaims)
+	}
+}
+
+// 上游错误体里的凭证必须被抹掉，否则会经 LastError 落到面板与日志。
+func TestTruncateStrRedactsSecrets(t *testing.T) {
+	in := `{"error":"bad","access_token":"AAAABBBB","refresh_token":"CCCCDDDD",` +
+		`"secret_access_key":"EEEEFFFF","x-auth-token":"GGGGHHHH"}`
+	out := truncateStr(in, 400)
+	for _, leak := range []string{"AAAABBBB", "CCCCDDDD", "EEEEFFFF", "GGGGHHHH"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("secret %q leaked: %s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `"access_token":"***"`) {
+		t.Fatalf("expected redacted field, got %s", out)
+	}
+}
+
+// 截断不能切坏多字节字符。
+func TestTruncateStrKeepsValidUTF8(t *testing.T) {
+	in := strings.Repeat("中文测试", 20)
+	out := truncateStr(in, 11) // 落在第 4 个汉字中间
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid utf8: %q", out)
+	}
+	if !strings.HasSuffix(out, "…") {
+		t.Fatalf("expected ellipsis marker: %q", out)
 	}
 }

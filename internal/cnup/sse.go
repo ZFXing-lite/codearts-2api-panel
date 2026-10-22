@@ -457,6 +457,16 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return RenderOpenAI(rc, model), nil
+}
+
+// RenderOpenAI 把聚合结果渲染成 OpenAI 非流式响应体。
+// 单独抽出来是因为调用方常常已经拿到 RawCompletion（要读 usage 记账），
+// 再走 Aggregate 就得重新解析一遍流。
+func RenderOpenAI(rc *RawCompletion, model string) map[string]any {
+	if rc == nil {
+		rc = &RawCompletion{}
+	}
 	message := map[string]any{"role": "assistant", "content": rc.Content}
 	if rc.Reasoning != "" {
 		message["reasoning_content"] = rc.Reasoning
@@ -467,13 +477,17 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 			message["content"] = nil
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": rc.Finish}},
-	}, nil
+	}
+	if len(rc.Usage) > 0 {
+		out["usage"] = rc.Usage
+	}
+	return out
 }
 
 // Stream 实时转换 SSE，保证至少一个 [DONE]。

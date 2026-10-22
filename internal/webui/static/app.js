@@ -6,15 +6,24 @@ function cookiePath() {
   return BASE || "/";
 }
 
+// admin_session 是 HttpOnly，JS 改不动它 —— 真正让会话失效的只有服务端的
+// /api/logout。这里保留一个显式提示，避免有人以为清理过 cookie 就等于退出。
 function clearSessionCookies() {
-  const paths = new Set(["/", cookiePath(), "/codearts", "/codearts/"]);
-  for (const p of paths) {
-    document.cookie = `admin_session=;path=${p};max-age=0`;
-  }
-
+  /* no-op by design: server-side logout invalidates the session */
 }
 
 let csrfToken = "";
+
+// 自动刷新定时器单例：init() 会被重复调用（登录成功、重连），
+// 不持有句柄的话每次登录都多挂一个 5 秒定时器，且 401 之后仍在跑。
+let _refreshTimer = null;
+
+function stopAutoRefresh() {
+  if (_refreshTimer) {
+    clearInterval(_refreshTimer);
+    _refreshTimer = null;
+  }
+}
 
 async function loadCSRF() {
   try {
@@ -31,15 +40,25 @@ async function api(url, options = {}) {
   if (options.method && options.method !== "GET" && options.method !== "HEAD" && csrfToken) {
     headers["X-CSRF-Token"] = csrfToken;
   }
-  const res = await fetch(BASE + url, {
-    credentials: "same-origin",
-    ...options,
-    headers,
-  });
+  let res;
+  try {
+    res = await fetch(BASE + url, {
+      credentials: "same-origin",
+      ...options,
+      headers,
+      // 后端卡死时不能让 UI 无限等待——15s 后自己收回来。
+      signal: options.signal || AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    if (err && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new Error("请求超时");
+    }
+    throw err;
+  }
   if (res.status === 401) {
     // login itself can 401 on bad password — keep message, don't loop-clear mid-login
     if (url !== "/api/login") {
-      clearSessionCookies();
+      stopAutoRefresh();
       showLogin();
       throw new Error("unauthorized");
     }
@@ -47,6 +66,23 @@ async function api(url, options = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
+}
+
+// openExternal 只放行 http(s) 且一律 noopener：授权地址来自后端 JSON，
+// 不校验 scheme 就是 javascript:/data: 注入面；不带 noopener 则第三方授权页
+// 能通过 window.opener 反向操作本面板（reverse tabnabbing）。
+function openExternal(url) {
+  if (!url) return;
+  let u;
+  try {
+    u = new URL(url, location.origin);
+  } catch (_) {
+    return toast("授权地址非法");
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    return toast("授权地址协议不合法：" + u.protocol);
+  }
+  window.open(u.href, "_blank", "noopener,noreferrer");
 }
 
 function $(id) {
@@ -413,7 +449,8 @@ async function init() {
     showApp();
     refreshAll(true);
     // Auto-refresh every 5s — lightweight, no quota refresh.
-    setInterval(() => {
+    stopAutoRefresh();
+    _refreshTimer = setInterval(() => {
       // Paused by user (observing a long task) — skip this tick.
       if (_autoRefreshPaused) return;
       // Don't refresh while user is interacting (typing, modal open, batch select).
@@ -430,15 +467,29 @@ async function init() {
         // Live indicator (in-flight / timestamp) is set inside loadDashboard.
       });
     }, 5000);
-  } catch {
-    showLogin();
+  } catch (e) {
+    // 只有真正未鉴权才回登录页。后端 500 / 反代 502 / 断网一律如实报错，
+    // 否则运维现场会被误导成"密码错了"。
+    stopAutoRefresh();
+    if (e && e.message === "unauthorized") {
+      showLogin();
+    } else {
+      const box = $("login-error");
+      if (box) box.textContent = "服务不可用：" + (e && e.message ? e.message : "未知错误");
+      showLogin();
+    }
   }
 }
 
 async function refreshAll(refreshQuota = false) {
   // Paint cached quota first. Waiting on 31 Huawei insight calls leaves
   // the overview/account table blank after every refresh.
-  await Promise.all([loadDashboard(), loadAccounts()]);
+  // allSettled：一个接口超时不该让另一张表也跟着空掉。
+  const [dashRes, acctRes] = await Promise.allSettled([loadDashboard(), loadAccounts()]);
+  const failed = [dashRes, acctRes].find((r) => r.status === "rejected");
+  if (failed && failed.reason && failed.reason.message !== "unauthorized") {
+    toast("刷新失败：" + failed.reason.message);
+  }
   if (document.querySelector("#p-cn")?.classList.contains("active")) loadCN();
   if (!refreshQuota) return;
   try {
@@ -810,7 +861,8 @@ function renderAccounts() {
     syncSelCount("acct");
     return;
   }
-  const keep = new Set(list.map((a) => a.id));
+  // 剪枝按全量而不是筛选结果：切换筛选标签不该清空用户已勾选的账号。
+  const keep = new Set((_accountsCache || []).map((a) => a.id));
   for (const id of [..._selAccounts]) {
     if (!keep.has(id)) _selAccounts.delete(id);
   }
@@ -910,6 +962,11 @@ async function runAccountBatch(action) {
   if (action === "set_proxy" || action === "clear_proxy") {
     body.action = "set_proxy";
     body.proxy_id = action === "clear_proxy" ? "" : ($("acct-batch-proxy")?.value || "");
+    // 下拉首项是"直连"：忘了选代理就点应用，会把选中的账号全部改成直连，
+    // 真实出口从代理切回本机且无确认、无回滚。
+    if (action === "set_proxy" && !body.proxy_id) {
+      return toast("先选择要绑定的代理（当前是直连）");
+    }
   }
   if (action === "delete" && !confirm(`确认删除选中的 ${ids.length} 个账号？`)) return;
   try {
@@ -1098,7 +1155,7 @@ async function startOAuth(accountId) {
     if (d.browser_opened || d.browser_private) {
       toast("已用无痕窗口打开授权页");
     } else if (d.authorize_url) {
-      window.open(d.authorize_url, "codearts_oauth_" + Date.now());
+      openExternal(d.authorize_url);
       toast("请在打开的窗口完成授权");
     }
     if (d.ticket_id) pollOAuthStatus(d.ticket_id);
@@ -1150,9 +1207,14 @@ $("login-form").addEventListener("submit", async (e) => {
 $("logout-btn").addEventListener("click", async () => {
   try {
     await api("/api/logout", { method: "POST" });
-  } catch (_) {}
-  clearSessionCookies();
+  } catch (e) {
+    // 退出失败就明说，不能切到登录页假装成功——服务端会话还活着。
+    toast("退出失败：" + e.message);
+    return;
+  }
+  stopAutoRefresh();
   showLogin();
+  location.reload();
 });
 
 $("add-account").addEventListener("click", async () => {
@@ -1412,10 +1474,17 @@ async function runProxyBatch(action) {
 }
 
 async function fillProxyBindSelects() {
-  const accounts = await api("/api/accounts").catch(() => []);
   const sa = $("bind-account");
   const sp = $("bind-proxy");
   if (!sa || !sp) return;
+  let accounts = [];
+  try {
+    accounts = await api("/api/accounts");
+  } catch (e) {
+    // 失败 ≠ 没有账号：直接显示"暂无账号"会让用户以为账号池被清空。
+    sa.innerHTML = `<option value="">加载失败：${esc(e.message)}</option>`;
+    return;
+  }
   sa.innerHTML = (accounts || [])
     .map((a) => {
       const tag = a.proxy_id ? ` · ${a.proxy_id.slice(0, 10)}` : "";
@@ -1559,23 +1628,39 @@ function keyScopeIsPick() {
   return document.querySelector('input[name="key-scope"]:checked')?.value === "pick";
 }
 
-async function fillKeyAccountPicker(selected) {
+async function fillKeyAccountPicker(selected, gate) {
   const box = $("key-acct-list");
   if (!box) return;
   const sel = new Set(selected || []);
+  // gate 必须参与渲染：事后 querySelectorAll 补勾会命中重绘前的空 DOM，
+  // 用户看到的是"按钮点了没反应"，实际建出的是全量 Key。
+  const gateMatch = (g) => {
+    if (!gate || gate === "*") return true;
+    if (gate === "ready") return g === "ready" || g === "quota_exhausted";
+    return g === gate;
+  };
   // API Key 可绑定全池（国际 + 国内），单独拉全量而不是复用国际版账户池缓存
   let items = _accountsCache || [];
+  let loadErr = "";
   try {
     items = await api("/api/accounts");
-  } catch (_) {}
+  } catch (e) {
+    loadErr = e.message || "网络错误";
+  }
   box.hidden = !keyScopeIsPick();
+  if (loadErr) {
+    // 后端 500 时显示"暂无账号"会让用户以为账号被清空。
+    box.innerHTML = `<div class="empty">账号列表加载失败：${esc(loadErr)}（刷新重试）</div>`;
+    return;
+  }
   if (!items.length) {
     box.innerHTML = `<div class="empty">还没有账号，先去账户池 / 国内码道导入</div>`;
     return;
   }
   box.innerHTML = items.map((a) => {
     const g = a.call_gate || "";
-    const checked = sel.has(a.id) ? "checked" : "";
+    const on = sel.size ? sel.has(a.id) : gateMatch(g);
+    const checked = on ? "checked" : "";
     const cn = a.channel === "cn" ? ' <span class="badge cn">CN</span>' : "";
     return `<label class="pick-row" data-gate="${esc(g)}">
       <input type="checkbox" value="${esc(a.id)}" ${checked}>
@@ -1593,25 +1678,11 @@ function collectPickedAccountIDs(root) {
   return [...scope.querySelectorAll(sel)].map((el) => el.value).filter(Boolean);
 }
 
-function setPickerByGate(gate) {
+async function setPickerByGate(gate) {
   document.querySelectorAll('input[name="key-scope"]').forEach((el) => {
     el.checked = el.value === "pick";
   });
-  fillKeyAccountPicker();
-  $("key-acct-list")?.querySelectorAll(".pick-row").forEach((row) => {
-    const box = row.querySelector("input");
-    if (!box) return;
-    const rowGate = row.dataset.gate || "";
-    if (gate === "*") {
-      box.checked = true;
-      return;
-    }
-    if (gate === "ready") {
-      box.checked = rowGate === "ready" || rowGate === "quota_exhausted";
-      return;
-    }
-    box.checked = rowGate === gate;
-  });
+  await fillKeyAccountPicker(null, gate);
 }
 
 function keyAllowLabel(k) {
@@ -1757,12 +1828,19 @@ async function deleteAPIKey(id) {
 async function editAPIKeyAccounts(id) {
   const box = $("apikey-edit-box");
   if (!box) return;
-  if (!_accountsCache.length) await loadAccounts();
+  // 必须用全池：_accountsCache 只含国际版。拿它渲染编辑弹层再保存，
+  // PUT 提交的是"仅国际版"的 id 集合，该 Key 已有的国内码道绑定会被静默删掉。
+  let items = [];
+  try {
+    items = await api("/api/accounts");
+  } catch (e) {
+    return toast("加载账号失败：" + e.message);
+  }
   const keys = (await api("/api/apikeys")).items || [];
   const k = keys.find((x) => x.id === id);
   if (!k) return toast("key 不存在");
   const selected = new Set(k.account_ids || []);
-  const items = _accountsCache || [];
+  const missing = (k.account_ids || []).filter((aid) => !items.some((a) => a.id === aid));
   box.style.display = "block";
   box.innerHTML =
     `<div class="muted" style="margin-bottom:8px">编辑「${esc(k.name)}」可用账号 · 一个都不勾 = 全部账号</div>` +
@@ -1776,6 +1854,8 @@ async function editAPIKeyAccounts(id) {
     </div>`;
   $("apikey-edit-save")?.addEventListener("click", async () => {
     const ids = collectPickedAccountIDs(box);
+    if (!ids.length && missing.length &&
+        !confirm(`该 Key 原有 ${missing.length} 个绑定账号已不在账号池，保存后会清空为"全部账号"。继续？`)) return;
     try {
       await api(`/api/apikeys/${id}`, { method: "PUT", body: JSON.stringify({ account_ids: ids }) });
       toast(ids.length ? `已限定 ${ids.length} 个账号` : "已改为全部账号");
@@ -1909,7 +1989,7 @@ function cnTokenBadge(v) {
   };
   const [cls, label] = map[v.token_state] || ["bb", v.token_state || "—"];
   const exp = v.token_expires ? `<div class="muted" style="font-size:11px">${esc(fmtTime(v.token_expires))}</div>` : "";
-  return `<span class="badge ${cls}">${label}</span>${exp}`;
+  return `<span class="badge ${esc(cls)}">${esc(label)}</span>${exp}`;
 }
 
 async function loadCN() {
@@ -2056,7 +2136,7 @@ async function cnLoginSubmit() {
     const status = $("cn-login-status");
     if (d.next_url) {
       if (status) status.textContent = d.message || "回调已接收";
-      window.open(d.next_url, "_blank", "noopener");
+      openExternal(d.next_url);
     } else if (d.status === "done") {
       const a = d.account || {};
       cnLoginReset();

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go-codearts/internal/kit"
 )
 
 // HuaweiModelClient calls the Huawei Cloud CodeArts internal model endpoint.
@@ -246,7 +248,7 @@ func (c *HuaweiModelClient) fetchOpenAIModels(ctx context.Context, u string, cre
 		return nil, err
 	}
 	if status >= 400 {
-		return nil, &UpstreamError{Status: status, Body: string(body[:min(len(body), 300)])}
+		return nil, &UpstreamError{Status: status, Body: kit.Snippet(string(body), 300)}
 	}
 	ids := parseModelIDs(body)
 	if len(ids) == 0 {
@@ -262,7 +264,7 @@ func (c *HuaweiModelClient) fetchAgentCenterModels(ctx context.Context, creds *O
 		return nil, err
 	}
 	if status >= 400 {
-		return nil, &UpstreamError{Status: status, Body: string(body[:min(len(body), 300)])}
+		return nil, &UpstreamError{Status: status, Body: kit.Snippet(string(body), 300)}
 	}
 	agentID := parseDefaultAgentID(body, "CodeAgent")
 	if agentID == "" {
@@ -274,7 +276,7 @@ func (c *HuaweiModelClient) fetchAgentCenterModels(ctx context.Context, creds *O
 		return nil, err
 	}
 	if status >= 400 {
-		return nil, &UpstreamError{Status: status, Body: string(body[:min(len(body), 300)])}
+		return nil, &UpstreamError{Status: status, Body: kit.Snippet(string(body), 300)}
 	}
 	ids := parseAgentCenterModelIDs(body)
 	if len(ids) == 0 {

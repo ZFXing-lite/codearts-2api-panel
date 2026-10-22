@@ -115,12 +115,14 @@ func (g *KeyGate) Acquire(keyID string, share int) bool {
 	if g == nil || keyID == "" {
 		return true
 	}
+	// 限额字段在锁内读：SetLimits 是持锁写的，锁外读会与热重载构成
+	// 数据竞争（-race 必报），也可能按旧值放行一个请求窗口。
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	limit := keyInflightLimit(g.maxInFlight, share)
 	if limit <= 0 && g.rpmLimit <= 0 {
 		return true
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	if limit > 0 && g.inflight[keyID] >= limit {
 		return false
 	}

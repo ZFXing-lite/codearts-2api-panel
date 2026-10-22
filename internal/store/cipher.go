@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +70,9 @@ func (c *FieldCipher) encrypt(plaintext string) string {
 	defer c.mu.Unlock()
 	nonce := make([]byte, c.gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		// 熵源故障时宁可明文落盘也不要丢凭证，但必须留下告警痕迹：
+		// 静默降级会让人以为字段已加密。
+		log.Printf("store: WARNING random source failed, sensitive field stored in PLAINTEXT: %v", err)
 		return plaintext
 	}
 	ciphertext := c.gcm.Seal(nonce, nonce, []byte(plaintext), nil)

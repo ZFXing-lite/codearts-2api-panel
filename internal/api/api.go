@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -748,6 +749,21 @@ func (s *Server) handleHuaweiModels(w http.ResponseWriter, r *http.Request) {
 	go s.warmModels(pick)
 }
 
+// debugHeaders 控制是否把内部账号 ID 回显给调用方。默认关闭：
+// 暴露账号标识能让持有任意 API key 的人定向打满某个账号，
+// 也把池内拓扑写进了客户端日志。
+func (s *Server) debugHeaders() bool {
+	return strings.TrimSpace(os.Getenv("DEBUG_HEADERS")) == "1"
+}
+
+// maxRequestBytes 返回请求体上限（boot 时取一次配置，缺省 16MiB）。
+func (s *Server) maxRequestBytes() int {
+	if s != nil && s.cfg.MaxRequestBytes > 0 {
+		return s.cfg.MaxRequestBytes
+	}
+	return 16 << 20
+}
+
 func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	// Panic safety net for the account in-flight slot. All ~5 explicit
@@ -792,11 +808,14 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Reject oversized requests early via Content-Length before reading body (BUG-23 fix).
-	if cl := r.ContentLength; cl > 16<<20 {
+	// 上限读配置：MAX_REQUEST_BYTES 曾经被这里硬编码的 16MiB 覆盖，
+	// 运维调小调大都不生效，而 /api/config 还把它当运行时配置展示。
+	maxBody := int64(s.maxRequestBytes())
+	if cl := r.ContentLength; cl > maxBody {
 		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -908,7 +927,18 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 	// (SSE replay) and non-streaming (JSON) requests.
 	var cacheKey, cacheModel string
 	if s.respCache != nil {
-		cacheKey, cacheModel = respcache.KeyFromRequest(body)
+		// scope = 租户(API key) + 渠道 + 裸模型名：缺了它缓存会跨租户串响应。
+		keyID := ""
+		if reqKey != nil {
+			keyID = reqKey.ID
+		}
+		mdl := peekModel(body)
+		realm := "intl"
+		if strings.HasPrefix(strings.ToLower(mdl), "cn:") {
+			realm = "cn"
+		}
+		scope := keyID + "|" + realm + "|" + mdl
+		cacheKey, cacheModel = respcache.KeyFromRequestScoped(body, scope)
 		if ent, ok := s.respCache.Get(cacheKey); ok {
 			log.Printf("chat cache_hit rid=%s key=%s model=%s stream=%v proto=%v", rid, cacheKey[:12], cacheModel, wantStream, proto)
 			recordStats(wantStream, true, 0, 0, 0)
@@ -953,7 +983,9 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 	if sessionID != "" && s.sessionStick != nil {
 		if aid, ok := s.sessionStick.Get(sessionID); ok && aid != "" {
 			w.Header().Set("X-Session-Affinity", "HIT")
-			w.Header().Set("X-Account-Id", aid)
+			if s.debugHeaders() {
+				w.Header().Set("X-Account-Id", aid)
+			}
 		}
 	}
 
@@ -1094,7 +1126,9 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		if heavy {
 			w.Header().Set("X-Request-Heavy", "1")
 		}
-		w.Header().Set("X-Account-Id", acc.ID)
+		if s.debugHeaders() {
+			w.Header().Set("X-Account-Id", acc.ID)
+		}
 		if stickyHit {
 			s.ensureChatClientWarm(acc)
 		}
@@ -2548,8 +2582,20 @@ func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
 			a.Status = "imported"
 		}
 		a.UpdatedAt = time.Now()
-		if err := s.db.Upsert(a); err != nil {
-			results = append(results, rowResult{Email: line.Email, Action: "error", Error: err.Error(), Line: raw})
+		// 新建走 Upsert；更新已有账号必须只写改动字段，否则旧快照会覆盖
+		// 并发写入的 Metadata / 续期 token。
+		var uerr error
+		if action == "created" {
+			uerr = s.db.Upsert(a)
+		} else {
+			snap := a
+			uerr = s.db.Mutate(snap.ID, func(fresh *store.Account) error {
+				*fresh = *snap
+				return nil
+			})
+		}
+		if uerr != nil {
+			results = append(results, rowResult{Email: line.Email, Action: "error", Error: uerr.Error(), Line: raw})
 			continue
 		}
 		if action == "created" {
@@ -2597,45 +2643,52 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad json")
 		return
 	}
-	if req.Email != "" {
-		a.Email = req.Email
-	}
-	if req.Password != "" {
-		a.Password = req.Password
-	}
-	if req.CountryCode != "" {
-		a.CountryCode = strings.ToUpper(req.CountryCode)
-	}
-	if req.Status != "" {
-		a.Status = req.Status
-	}
-	if req.RefreshToken != "" {
-		a.RefreshToken = req.RefreshToken
-	}
-	if req.Credentials != nil {
-		a.Credentials = req.Credentials
-		if !req.Credentials.Expiration.IsZero() {
-			a.TokenExpires = req.Credentials.Expiration
+	// 必须 Mutate：a 是 Get 得到的副本，整份 Upsert 会用旧快照覆盖并发期间
+	// 写入的 Metadata（签到/保活标记）、续期后的 token 与用量。
+	if err := s.db.Mutate(id, func(a *store.Account) error {
+		if req.Email != "" {
+			a.Email = req.Email
 		}
-	}
-	if req.Metadata != nil {
-		if a.Metadata == nil {
-			a.Metadata = map[string]string{}
+		if req.Password != "" {
+			a.Password = req.Password
 		}
-		for k, v := range req.Metadata {
-			a.Metadata[k] = v
+		if req.CountryCode != "" {
+			a.CountryCode = strings.ToUpper(req.CountryCode)
 		}
-	}
-	if req.UserToken != "" {
-		if a.Metadata == nil {
-			a.Metadata = map[string]string{}
+		if req.Status != "" {
+			a.Status = req.Status
 		}
-		a.Metadata["user_token"] = req.UserToken
-	}
-	a.UpdatedAt = time.Now()
-	if err := s.db.Upsert(a); err != nil {
+		if req.RefreshToken != "" {
+			a.RefreshToken = req.RefreshToken
+		}
+		if req.Credentials != nil {
+			a.Credentials = req.Credentials
+			if !req.Credentials.Expiration.IsZero() {
+				a.TokenExpires = req.Credentials.Expiration
+			}
+		}
+		if req.Metadata != nil {
+			if a.Metadata == nil {
+				a.Metadata = map[string]string{}
+			}
+			for k, v := range req.Metadata {
+				a.Metadata[k] = v
+			}
+		}
+		if req.UserToken != "" {
+			if a.Metadata == nil {
+				a.Metadata = map[string]string{}
+			}
+			a.Metadata["user_token"] = req.UserToken
+		}
+		a.UpdatedAt = time.Now()
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if fresh, gerr := s.db.Get(id); gerr == nil && fresh != nil {
+		a = fresh
 	}
 	writeJSON(w, http.StatusOK, redactAccount(a))
 }
@@ -2644,8 +2697,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 // Ties within a tier fall through to the existing load/stick/recency scorer.
 func (s *Server) handlePatchAccountPriority(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	a, err := s.db.Get(id)
-	if err != nil {
+	if _, err := s.db.Get(id); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -2662,13 +2714,14 @@ func (s *Server) handlePatchAccountPriority(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusBadRequest, "priority must be in [-1000, 1000]")
 		return
 	}
-	a.Priority = *req.Priority
-	a.UpdatedAt = time.Now()
-	if err := s.db.Upsert(a); err != nil {
+	if err := s.db.Mutate(id, func(a *store.Account) error {
+		a.Priority = *req.Priority
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"account_id": a.ID, "priority": a.Priority})
+	writeJSON(w, http.StatusOK, map[string]any{"account_id": id, "priority": *req.Priority})
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -2823,8 +2876,8 @@ func (s *Server) refreshAccountQuota(ctx context.Context, a *store.Account) (*st
 		}
 		snap.Error = err.Error()
 		snap.FetchedAt = time.Now()
-		a.Quota = snap
-		_ = s.db.Upsert(a)
+		// 只写 quota：整份 Upsert 会用旧快照覆盖并发写入的 Metadata / token。
+		s.applyAccountMutation(a, func(fresh *store.Account) { fresh.Quota = snap })
 		return nil, err
 	}
 	sum := info.Summary()
@@ -2856,12 +2909,12 @@ func (s *Server) refreshAccountQuota(ctx context.Context, a *store.Account) (*st
 	}
 	snap.NormalizeRemain()
 	carryResetObservation(a.Quota, snap, time.Now())
-	a.Quota = snap
-	a.Opened = sum.PackageStatus == "normal" || sum.PackageTokens > 0 || sum.RemainTokens > 0
-	a.RecomputeCallGate(time.Now())
-	if err := s.db.Upsert(a); err != nil {
-		return snap, err
-	}
+	opened := sum.PackageStatus == "normal" || sum.PackageTokens > 0 || sum.RemainTokens > 0
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.Quota = snap
+		fresh.Opened = opened
+		fresh.RecomputeCallGate(time.Now())
+	})
 	return snap, nil
 }
 
@@ -2874,18 +2927,18 @@ func (s *Server) refreshAccountModels(ctx context.Context, a *store.Account) ([]
 	client := huawei.NewHuaweiModelClient(s.cfg.HuaweiModelBase, s.cfg.HuaweiModelsURL)
 	ctx = huawei.WithHTTPClient(ctx, s.httpClientForAccount(a))
 	if err := client.RefreshModels(ctx, creds); err != nil {
-		a.ModelsError = err.Error()
-		a.ModelsFetchedAt = time.Now()
-		_ = s.db.Upsert(a)
+		s.applyAccountMutation(a, func(fresh *store.Account) {
+			fresh.ModelsError = err.Error()
+			fresh.ModelsFetchedAt = time.Now()
+		})
 		return nil, err
 	}
 	models := client.ModelIDs()
-	a.Models = models
-	a.ModelsError = ""
-	a.ModelsFetchedAt = time.Now()
-	if err := s.db.Upsert(a); err != nil {
-		return models, err
-	}
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.Models = models
+		fresh.ModelsError = ""
+		fresh.ModelsFetchedAt = time.Now()
+	})
 	return models, nil
 }
 
@@ -2919,24 +2972,30 @@ func (s *Server) handleSetIAMAkSk(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "access_key_id and secret_access_key required")
 		return
 	}
-	a.Credentials = &store.Credentials{
+	cred := &store.Credentials{
 		AccessKeyID:     ak,
 		SecretAccessKey: sk,
 		SecurityToken:   "",
 		Expiration:      time.Time{},
 		AuthMode:        "iam_permanent",
 	}
-	if a.Metadata == nil {
-		a.Metadata = map[string]string{}
-	}
-	a.Metadata["auth_mode"] = "iam_permanent"
-	a.Metadata["cli_env"] = "CODEARTS_CLI_AK / CODEARTS_CLI_SK"
-	a.Status = "token_ok"
-	a.TokenExpires = time.Time{}
-	a.Opened = true
-	if err := s.db.Upsert(a); err != nil {
+	if err := s.db.Mutate(a.ID, func(fresh *store.Account) error {
+		fresh.Credentials = cred
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata["auth_mode"] = "iam_permanent"
+		fresh.Metadata["cli_env"] = "CODEARTS_CLI_AK / CODEARTS_CLI_SK"
+		fresh.Status = "token_ok"
+		fresh.TokenExpires = time.Time{}
+		fresh.Opened = true
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if fresh, gerr := s.db.Get(a.ID); gerr == nil && fresh != nil {
+		a = fresh
 	}
 	// 立刻按官方永久 AK/SK 拉模型+额度
 	out := map[string]any{"account": redactAccount(a), "auth_mode": "iam_permanent"}
@@ -2993,11 +3052,20 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	if res.RefreshToken != "" {
 		a.RefreshToken = res.RefreshToken
 	}
-	a.TokenExpires = res.Expiration
-	a.Status = "token_ok"
-	if err := s.db.Upsert(a); err != nil {
+	if err := s.db.Mutate(a.ID, func(fresh *store.Account) error {
+		fresh.Credentials = a.Credentials
+		if res.RefreshToken != "" {
+			fresh.RefreshToken = res.RefreshToken
+		}
+		fresh.TokenExpires = res.Expiration
+		fresh.Status = "token_ok"
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if fresh, gerr := s.db.Get(a.ID); gerr == nil && fresh != nil {
+		a = fresh
 	}
 	writeJSON(w, http.StatusOK, redactAccount(a))
 }

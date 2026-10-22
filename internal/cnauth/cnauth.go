@@ -8,6 +8,7 @@ package cnauth
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,8 +33,27 @@ type File struct {
 	ChatID string `json:"chat_id,omitempty"`
 }
 
+// SafeID 把上游给的 user_id 收敛成可用作文件名与账号 ID 的形态。
+// user_id 来自上游响应，直接拼路径就是路径穿越（可以写出 auth 目录）。
+func SafeID(userID string) string {
+	var b strings.Builder
+	for _, r := range userID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" || out == "." || out == ".." {
+		return ""
+	}
+	return out
+}
+
 // FileName 返回该账号的凭证文件名。
-func FileName(userID string) string { return "codearts-" + userID + ".json" }
+func FileName(userID string) string { return "codearts-" + SafeID(userID) + ".json" }
 
 // IsAuthFile 判断目录项是否为登录产物。
 func IsAuthFile(name string) bool {
@@ -42,6 +62,9 @@ func IsAuthFile(name string) bool {
 
 // Save 写盘：临时文件 + rename，避免半写文件被导入方读到。
 func Save(dir string, f *File) (string, error) {
+	if SafeID(f.UserID) == "" {
+		return "", fmt.Errorf("invalid user_id %q", f.UserID)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}

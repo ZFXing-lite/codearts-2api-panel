@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"go-codearts/internal/proxypool"
+	"go-codearts/internal/store"
 )
 
 func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
@@ -132,8 +133,8 @@ func (s *Server) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, a := range s.db.List() {
 		if a.ProxyID == id {
-			a.ProxyID = ""
-			_ = s.db.Upsert(a)
+			// 只解绑这一个字段，别把整份旧快照写回去。
+			s.applyAccountMutation(a, func(fresh *store.Account) { fresh.ProxyID = "" })
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": "deleted"})
@@ -213,8 +214,10 @@ func (s *Server) handleSetAccountProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	a.ProxyID = req.ProxyID
-	if err := s.db.Upsert(a); err != nil {
+	if err := s.db.Mutate(a.ID, func(fresh *store.Account) error {
+		fresh.ProxyID = req.ProxyID
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

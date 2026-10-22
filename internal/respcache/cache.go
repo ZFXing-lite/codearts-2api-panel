@@ -94,6 +94,20 @@ func KeyFromRequest(raw []byte) (key, model string) {
 	return hex.EncodeToString(sum[:]), model
 }
 
+// KeyFromRequestScoped 在请求体哈希之外再掺入作用域（API key + 渠道 + 裸模型名）。
+//
+// 只用请求体做键时，两个租户发同样的 prompt 会命中同一条上游回复——租户隔离
+// 被破坏，而且命中按 0 token 记账等于免费；cn:GLM-5.2 与 intl 的同名模型
+// 也会共用键，国内请求可能拿到国际账号的应答。
+func KeyFromRequestScoped(raw []byte, scope string) (key, model string) {
+	k, model := KeyFromRequest(raw)
+	if scope == "" {
+		return k, model
+	}
+	sum := sha256.Sum256([]byte(scope + "\x00" + k))
+	return hex.EncodeToString(sum[:]), model
+}
+
 func (c *Cache) Get(key string) (*Entry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

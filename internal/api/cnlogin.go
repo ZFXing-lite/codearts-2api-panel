@@ -40,17 +40,63 @@ const cnLoginTTL = 10 * time.Minute
 type cnLoginSession struct {
 	ID       string
 	TicketID string
-	Secret   string // 本地生成；portal 回调后覆盖为上游认可的值
 	Verifier string
 	Port     int
 	DPoP     cnup.DPoPPrivateJWK
 	AuthURL  string
 	Created  time.Time
 
-	Done           bool
-	Err            string
-	TicketFallback bool
-	Account        map[string]any
+	// mu 保护下面的可变字段：面板每 2 秒轮询状态，而 portal 回调在另一个
+	// goroutine 里落结果，两边无锁读写会读到 Done=true 但 Account=nil，
+	// 或让同一次登录被保存两遍。
+	mu             sync.Mutex
+	secret         string // 本地初始值；portal 回调后覆盖为上游认可的值
+	done           bool
+	errMsg         string
+	ticketFallback bool
+	account        map[string]any
+}
+
+// markDone 记录成功结果（再次调用无副作用）。
+func (s *cnLoginSession) markDone(acct map[string]any) {
+	s.mu.Lock()
+	s.done, s.account, s.errMsg = true, acct, ""
+	s.mu.Unlock()
+}
+
+// markErr 记录失败。
+func (s *cnLoginSession) markErr(msg string) {
+	s.mu.Lock()
+	s.done, s.errMsg = true, msg
+	s.mu.Unlock()
+}
+
+// snapshot 一次性读出状态，避免多次加锁读到互相矛盾的字段。
+func (s *cnLoginSession) snapshot() (done bool, errMsg string, acct map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done, s.errMsg, s.account
+}
+
+// setSecret 记录 portal 下发的 secret 并开启 ticket 轮询通道。
+func (s *cnLoginSession) setSecret(secret string) {
+	s.mu.Lock()
+	s.secret, s.ticketFallback = secret, true
+	s.mu.Unlock()
+}
+
+// pollSecret 返回当前可用的 secret 与是否已开启轮询通道。
+func (s *cnLoginSession) pollSecret() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.secret, s.ticketFallback
+}
+
+// newSecretForSession 创建时写入本地 secret。
+func (s *cnLoginSession) initSecret(secret string) {
+	s.mu.Lock()
+	s.secret = secret
+	s.mu.Unlock()
 }
 
 type cnLoginStore struct {
@@ -208,10 +254,12 @@ func (s *Server) handleCNLoginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.cnLogins.put(&cnLoginSession{
-		ID: sessID, TicketID: ticketID, Secret: secret, Verifier: verifier,
+	sess := &cnLoginSession{
+		ID: sessID, TicketID: ticketID, Verifier: verifier,
 		Port: port, DPoP: dpopJWK, AuthURL: authURL, Created: time.Now(),
-	})
+	}
+	sess.initSecret(secret)
+	s.cnLogins.put(sess)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session_id": sessID,
@@ -272,17 +320,18 @@ func (s *Server) handleCNLoginStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "expired", "message": "会话已过期，请重新发起登录"})
 		return
 	}
-	if sess.Done {
-		if sess.Err != "" {
-			writeJSON(w, http.StatusOK, map[string]any{"status": "error", "message": sess.Err})
+	if done, errMsg, acct := sess.snapshot(); done {
+		if errMsg != "" {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "error", "message": errMsg})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "done", "message": "登录成功", "account": sess.Account})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "done", "message": "登录成功", "account": acct})
 		return
 	}
 	// 只有 portal 明确下发过 secret（回环回调或粘贴回调）才能走 ticket 通道；
 	// 否则本地 secret 上游不认，轮询只会白白撞墙。
-	if !sess.TicketFallback {
+	secret, fallback := sess.pollSecret()
+	if !fallback {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "pending", "message": "等待浏览器完成授权…",
 		})
@@ -290,7 +339,7 @@ func (s *Server) handleCNLoginStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	tok, err := s.cnUpstream().PollTicket(ctx, cnup.DefaultLoginConfig(), sess.TicketID, sess.Secret)
+	tok, err := s.cnUpstream().PollTicket(ctx, cnup.DefaultLoginConfig(), sess.TicketID, secret)
 	if err != nil || tok == nil || tok.UserName == "" || tok.Credentials.SecurityToken == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "pending", "message": "上游还没放行，稍候自动重试…",
@@ -299,11 +348,11 @@ func (s *Server) handleCNLoginStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.saveCNLogin(tok, sess.Verifier, sess.DPoP)
 	if err != nil {
-		sess.Done, sess.Err = true, err.Error()
+		sess.markErr(err.Error())
 		writeJSON(w, http.StatusOK, map[string]any{"status": "error", "message": err.Error()})
 		return
 	}
-	sess.Done, sess.Account = true, acct
+	sess.markDone(acct)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "done", "message": "登录成功，账号已入库", "account": acct})
 }
 
@@ -347,8 +396,9 @@ func (s *Server) handleCNLoginCallbackPaste(w http.ResponseWriter, r *http.Reque
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		_, _, acct := sess.snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "done", "message": "OAuth 登录成功，账号已入库", "account": sess.Account,
+			"status": "done", "message": "OAuth 登录成功，账号已入库", "account": acct,
 		})
 		return
 	}
@@ -376,8 +426,7 @@ func (s *Server) cnApplySecret(sess *cnLoginSession, secret, nextURL string) (st
 		next.Query().Get("ticket_id") != sess.TicketID {
 		return "", fmt.Errorf("回调地址缺少本次授权的 secret / redirect 信息")
 	}
-	sess.Secret = secret
-	sess.TicketFallback = true
+	sess.setSecret(secret)
 	return nextURL, nil
 }
 
@@ -386,17 +435,16 @@ func (s *Server) cnApplyCode(r *http.Request, sess *cnLoginSession, code string)
 	lcfg := cnup.DefaultLoginConfig()
 	tok, err := s.cnUpstream().ExchangeCode(r.Context(), lcfg, code, sess.Verifier, sess.Port, sess.DPoP)
 	if err != nil {
-		sess.Done = true
-		sess.Err = "换取 token 失败: " + err.Error()
-		return fmt.Errorf("%s", sess.Err)
+		msg := "换取 token 失败: " + err.Error()
+		sess.markErr(msg)
+		return fmt.Errorf("%s", msg)
 	}
 	acct, err := s.saveCNLogin(tok, sess.Verifier, sess.DPoP)
 	if err != nil {
-		sess.Done = true
-		sess.Err = err.Error()
+		sess.markErr(err.Error())
 		return err
 	}
-	sess.Done, sess.Account = true, acct
+	sess.markDone(acct)
 	return nil
 }
 
@@ -436,7 +484,7 @@ func (s *cnLoginStore) onlyActive() *cnLoginSession {
 	defer s.mu.Unlock()
 	var found *cnLoginSession
 	for _, sess := range s.m {
-		if sess.Done {
+		if done, _, _ := sess.snapshot(); done {
 			continue
 		}
 		if found != nil {
@@ -450,11 +498,12 @@ func (s *cnLoginStore) onlyActive() *cnLoginSession {
 func (s *Server) cnCallbackPage(w http.ResponseWriter, sess *cnLoginSession) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	done, errMsg, acct := sess.snapshot()
 	switch {
-	case sess.Done && sess.Err == "":
+	case done && errMsg == "":
 		name := ""
-		if sess.Account != nil {
-			if v, ok := sess.Account["name"].(string); ok {
+		if acct != nil {
+			if v, ok := acct["name"].(string); ok {
 				name = v
 			}
 		}
@@ -462,11 +511,11 @@ func (s *Server) cnCallbackPage(w http.ResponseWriter, sess *cnLoginSession) {
 <body style="font-family:system-ui;padding:40px;max-width:640px">
 <h2>国内码道登录成功</h2><p>账号：%s</p><p>凭据已入库，可以关闭此页面回到面板。</p>
 </body></html>`, htmlEscape(name))
-	case sess.Err != "":
+	case errMsg != "":
 		fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>登录失败</title></head>
 <body style="font-family:system-ui;padding:40px;max-width:640px">
 <h2>登录失败</h2><p>%s</p><p>回到面板重试，或把本页地址整段粘贴到「粘贴回调地址」。</p>
-</body></html>`, htmlEscape(sess.Err))
+</body></html>`, htmlEscape(errMsg))
 	default:
 		fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>授权进行中</title></head>
 <body style="font-family:system-ui;padding:40px;max-width:640px">

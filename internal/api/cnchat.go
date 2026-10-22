@@ -34,6 +34,7 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 		return false, true, false, true
 	}
 	defer release()
+	cnStarted := time.Now()
 
 	if acc.Metadata["cn_needs_relogin"] == "true" {
 		return false, true, false, false
@@ -67,10 +68,19 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 
 	rc, err := s.cnUpstream().ChatStreamWithOptions(ctx, chatID, msgs, traceID, cred, acc.Email, model, opts, benefit)
 	if err != nil {
+		// CN 之前完全绕过熔断与失败计数：坏账号被反复首选，面板上的
+		// SuccessCount/FailCount 恒为 0。这里补齐，与国际版对齐。
+		if s.circuit != nil {
+			s.circuit.RecordFailureWithType(acc.ID, classifyError(0, err.Error()), 0)
+		}
 		if s.cnMarkReloginErr(acc, err) || cnIsAuthErr(err) {
+			s.recordAccountFail(acc, err.Error())
+			s.cnCooldownIfNeeded(acc)
 			return false, true, false, false
 		}
 		if isTransientUpstreamErr(err) || errors.Is(err, context.DeadlineExceeded) {
+			s.recordAccountRotate(acc, "cn upstream timeout (rotated)")
+			s.markAccountSessionBusy(acc.ID, s.cfg.CNSoftCooldown)
 			return false, true, false, false
 		}
 		if ctx.Err() != nil {
@@ -82,23 +92,43 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 	defer rc.Close()
 
 	s.cnTouchActive(acc)
+	if s.circuit != nil {
+		s.circuit.RecordSuccess(acc.ID)
+	}
 
+	// usage 必须接出来：CN 此前全程不记账，账号的 SuccessCount / TokenUsed /
+	// LastLatency / Depleted() 永远停在导入初值，面板显示"从未使用"，
+	// 选号也无法按真实余额倾斜；按 key 的 token 配额同样记 0。
+	var cnPrompt, cnCompletion, cnTotal float64
 	if wantStream && proto == protoChat {
-		serr := cnup.StreamCapture(w, rc, model, func(*cnup.RawCompletion) {})
+		serr := cnup.StreamCaptureWithUsage(w, rc, model, func(fin *cnup.RawCompletion) {
+			cnPrompt, cnCompletion, cnTotal = cnUsageTokens(fin)
+		}, func(fin *cnup.RawCompletion) map[string]any {
+			p, comp, tot := cnUsageTokens(fin)
+			return map[string]any{
+				"prompt_tokens": p, "completion_tokens": comp, "total_tokens": tot,
+			}
+		})
 		if serr != nil {
 			log.Printf("cn chat stream rid=%s account=%s mid-stream err=%v", reqIDFromRequest(r), acc.ID, serr)
+		}
+		if serr == nil {
+			s.recordAccountSuccessFull(acc, cnTotal, cnPrompt, cnCompletion, time.Since(cnStarted).Milliseconds())
 		}
 		return true, false, serr == nil, false
 	}
 
-	agg, err := cnup.Aggregate(rc, model)
-	if err != nil {
-		if s.cnMarkReloginErr(acc, err) {
+	aggRaw, aggErr := cnup.AggregateRaw(rc)
+	if aggErr != nil {
+		if s.cnMarkReloginErr(acc, aggErr) {
 			return false, true, false, false
 		}
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cn upstream aggregate: %v", err))
+		writeErr(w, http.StatusBadGateway, fmt.Sprintf("cn upstream aggregate: %v", aggErr))
 		return true, false, false, false
 	}
+	cnPrompt, cnCompletion, cnTotal = cnUsageTokens(aggRaw)
+	s.recordAccountSuccessFull(acc, cnTotal, cnPrompt, cnCompletion, time.Since(cnStarted).Milliseconds())
+	agg := cnup.RenderOpenAI(aggRaw, model)
 	raw, _ := json.Marshal(agg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -266,7 +296,16 @@ func (s *Server) cnRefresh(acc *store.Account) error {
 	if raw := acc.Metadata["cn_dpop_private_key"]; raw != "" {
 		_ = json.Unmarshal([]byte(raw), &dpop)
 	}
-	tr, err := s.cnUpstream().RefreshToken(context.Background(), loginCfg,
+	// 刷新必须带超时：客户端断开了也要在 CN_UPSTREAM_TIMEOUT 内收敛，
+	// 否则会一边跑满 120s 一边长期占着 RefreshLock，把 cnwatch 的续期
+	// 和其它请求的 inline 刷新全部堵在队列里。
+	timeout := s.cfg.CNUpstreamTimeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tr, err := s.cnUpstream().RefreshToken(ctx, loginCfg,
 		acc.RefreshToken, acc.Metadata["cn_code_verifier"], dpop)
 	if err != nil {
 		return err
@@ -314,6 +353,63 @@ func applyCNTokenResponse(acc *store.Account, tr *cnup.TokenResponse) {
 
 // cnMarkReloginErr flags the account when the refresh token is dead.
 // Returns true when the error was of that class.
+// cnUsageTokens 从上游 usage 报文中取三类 token 数（缺失时返回 0）。
+func cnUsageTokens(rc *cnup.RawCompletion) (prompt, completion, total float64) {
+	if rc == nil || rc.Usage == nil {
+		return 0, 0, 0
+	}
+	num := func(k string) float64 {
+		switch v := rc.Usage[k].(type) {
+		case float64:
+			return v
+		case float32:
+			return float64(v)
+		case int:
+			return float64(v)
+		case int64:
+			return float64(v)
+		case json.Number:
+			f, _ := v.Float64()
+			return f
+		}
+		return 0
+	}
+	prompt = num("prompt_tokens")
+	if prompt == 0 {
+		prompt = num("input_tokens")
+	}
+	completion = num("completion_tokens")
+	if completion == 0 {
+		completion = num("output_tokens")
+	}
+	total = num("total_tokens")
+	if total == 0 {
+		total = prompt + completion
+	}
+	return prompt, completion, total
+}
+
+// cnCooldownIfNeeded 让 CN_ERR_THRESHOLD / CN_ERR_COOLDOWN 真正生效：
+// 连续失败达到阈值就把账号晾一段时间，别让每个新请求都先去撞一次坏账号。
+func (s *Server) cnCooldownIfNeeded(acc *store.Account) {
+	if s == nil || acc == nil {
+		return
+	}
+	threshold := int64(s.cfg.CNErrThreshold)
+	if threshold <= 0 {
+		threshold = 3
+	}
+	// applyAccountMutation 会把累计值回写到调用方副本上
+	if acc.FailCount < threshold {
+		return
+	}
+	d := s.cfg.CNErrCooldown
+	if d <= 0 {
+		d = 10 * time.Minute
+	}
+	s.markAccountSessionBusy(acc.ID, d)
+	log.Printf("cn cooldown account=%s fails=%d for=%s", acc.ID, acc.FailCount, d)
+}
 func (s *Server) cnMarkReloginErr(acc *store.Account, err error) bool {
 	var rte *cnup.RefreshTokenExpiredError
 	if !errors.As(err, &rte) {

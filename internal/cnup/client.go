@@ -23,6 +23,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"go-codearts/internal/kit"
 	"sync/atomic"
 	"time"
 )
@@ -562,13 +564,16 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	if benefit {
 		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
 	}
-	signRequest(httpReq, raw, cred)
+	// 签名覆盖请求里的全部头：Chat-Id/Session-Id 必须在 signRequest 之前写入。
+	// 放到后面会让 Authorization 的 SignedHeaders 与实际发的头不一致，
+	// 上游重算 canonical request 时必然不匹配（403）。
 	if chatID != "" {
 		httpReq.Header.Set("Chat-Id", chatID)
 	}
 	if sessionID != "" {
 		httpReq.Header.Set("Session-Id", sessionID)
 	}
+	signRequest(httpReq, raw, cred)
 	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -713,13 +718,7 @@ func Log(format string, args ...any) {
 	log.Printf("upstream: "+format, args...)
 }
 
-func truncateStr(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
-}
+func truncateStr(s string, n int) string { return kit.Snippet(s, n) }
 
 // CallerIdentity 用 STS 凭证查账号身份：GET {sts}/v5/caller-identity。
 // 返回 user_id(principal_id)、user_name(principal_urn 尾段)、domain_id(account_id)。

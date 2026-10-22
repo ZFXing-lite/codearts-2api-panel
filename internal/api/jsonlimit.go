@@ -14,8 +14,13 @@ type limitedDecoder struct {
 	dec *json.Decoder
 }
 
-func newLimitedDecoder(r io.Reader) *limitedDecoder {
-	dec := json.NewDecoder(io.LimitReader(r, 16<<20))
+// maxBody <= 0 时用 16MiB 兜底（历史行为）。
+func newLimitedDecoder(r io.Reader, maxBody ...int64) *limitedDecoder {
+	size := int64(16 << 20)
+	if len(maxBody) > 0 && maxBody[0] > 0 {
+		size = maxBody[0]
+	}
+	dec := json.NewDecoder(io.LimitReader(r, size))
 	return &limitedDecoder{dec: dec}
 }
 

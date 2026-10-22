@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"go-codearts/internal/kit"
 )
 
 // Hybrid region layout (intl CodeArts_Tui CLI):
@@ -183,7 +185,7 @@ func ExchangeCodeForToken(ctx context.Context, code, verifier, redirectURI strin
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("token exchange %d: %s", resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("token exchange %d: %s", resp.StatusCode, kit.Snippet(string(raw), 300))
 	}
 	var data struct {
 		Credentials struct {
@@ -229,7 +231,7 @@ func ExchangeSecretForToken(ctx context.Context, ticketID, secret string) (*OAut
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			lastErr = fmt.Errorf("ticket exchange %d: %s", resp.StatusCode, string(raw))
+			lastErr = fmt.Errorf("ticket exchange %d: %s", resp.StatusCode, kit.Snippet(string(raw), 300))
 			continue
 		}
 		var data struct {

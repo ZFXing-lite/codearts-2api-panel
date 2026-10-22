@@ -48,6 +48,10 @@ type CheckinResult struct {
 	Credits   float64             `json:"credits,omitempty"`
 	Message   string              `json:"message"`
 	Campaigns []CreditClaimResult `json:"campaigns"`
+	// Matched 是本次真正命中的签到/新手活动数。上游返回 200 但活动列表为空
+	// （灰度、配置延迟、部分故障）时 Matched=0，调用方不能据此判定"今日已签"，
+	// 否则当天漏签且本地闸门已经关上，再也不会重试。
+	Matched int `json:"matched"`
 }
 
 func (c *Client) creditRequest(ctx context.Context, method, path string, body any, cred SignCredential) (json.RawMessage, error) {
@@ -129,6 +133,7 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
 			continue
 		}
+		out.Matched++
 		res := c.claimCreditCampaign(ctx, cred, campaign, time.Now())
 		out.Campaigns = append(out.Campaigns, res)
 		out.OK = out.OK && res.OK
@@ -191,7 +196,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		}
 		_, err := c.creditRequest(ctx, http.MethodPost, EpCreditClaim, map[string]any{
 			"campaignId": campaign.ID, "channel": creditChannel,
-			"idempotentKey": fmt.Sprintf("claim_%d_%d", campaign.ID, now.UnixMilli()),
+			"idempotentKey": fmt.Sprintf("claim_%s_%d_%s", cred.AccessKeyID, campaign.ID, now.In(hwCST).Format("2006-01-02")),
 		}, cred)
 		if err != nil {
 			res.OK, res.Message = false, err.Error()

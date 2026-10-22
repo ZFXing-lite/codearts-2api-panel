@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go-codearts/internal/huawei"
+	"go-codearts/internal/kit"
 	"go-codearts/internal/store"
 )
 
@@ -81,37 +82,60 @@ func (s *Server) recordAccountSuccessFull(a *store.Account, usageTokens, promptT
 		return
 	}
 	now := time.Now()
-	a.LastUsedAt = now
-	a.LastSuccessAt = now
-	a.LastError = ""
-	a.SuccessCount++
-	if promptTok > 0 {
-		a.PromptTokens += promptTok
-	}
-	if completionTok > 0 {
-		a.CompletionTokens += completionTok
-	}
-	if latencyMS > 0 {
-		a.LastLatencyMS = latencyMS
-	}
-	if usageTokens > 0 && a.Quota != nil {
-		a.Quota.NormalizeRemain()
-		a.Quota.UsedTokens += usageTokens
-		if a.Quota.PackageTokens > 0 {
-			a.Quota.RemainTokens = a.Quota.PackageTokens - a.Quota.UsedTokens
-			if a.Quota.RemainTokens < 0 {
-				a.Quota.RemainTokens = 0
-			}
-			a.Quota.UsagePercent = a.Quota.UsedTokens / a.Quota.PackageTokens * 100
-		} else if a.Quota.RemainTokens > 0 {
-			a.Quota.RemainTokens -= usageTokens
-			if a.Quota.RemainTokens < 0 {
-				a.Quota.RemainTokens = 0
+	// 只写用量相关字段。不能整份 Upsert：a 是 List() 拿到的旧快照，
+	// 整体写回会用旧值覆盖并发期间写入的 Metadata（签到标记、cn_last_active）、
+	// 续期后的 refresh_token、禁用状态。
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.LastUsedAt = now
+		fresh.LastSuccessAt = now
+		fresh.LastError = ""
+		fresh.SuccessCount++
+		if promptTok > 0 {
+			fresh.PromptTokens += promptTok
+		}
+		if completionTok > 0 {
+			fresh.CompletionTokens += completionTok
+		}
+		if latencyMS > 0 {
+			fresh.LastLatencyMS = latencyMS
+		}
+		if usageTokens > 0 && fresh.Quota != nil {
+			fresh.Quota.NormalizeRemain()
+			fresh.Quota.UsedTokens += usageTokens
+			if fresh.Quota.PackageTokens > 0 {
+				fresh.Quota.RemainTokens = fresh.Quota.PackageTokens - fresh.Quota.UsedTokens
+				if fresh.Quota.RemainTokens < 0 {
+					fresh.Quota.RemainTokens = 0
+				}
+				fresh.Quota.UsagePercent = fresh.Quota.UsedTokens / fresh.Quota.PackageTokens * 100
+			} else if fresh.Quota.RemainTokens > 0 {
+				fresh.Quota.RemainTokens -= usageTokens
+				if fresh.Quota.RemainTokens < 0 {
+					fresh.Quota.RemainTokens = 0
+				}
 			}
 		}
+		fresh.RecomputeCallGate(now)
+	})
+}
+
+// applyAccountMutation 把一次修改落到库里。必须是 Mutate：Get/List 返回的是
+// 副本，用 Upsert 把整份副本写回去会覆盖并发期间别的 goroutine 改过的字段
+// （续期后的 refresh_token、签到标记、禁用状态）。改完整份再回读，
+// 让调用方手里的副本与库一致。
+func (s *Server) applyAccountMutation(a *store.Account, fn func(*store.Account)) {
+	if s == nil || a == nil || a.ID == "" || fn == nil {
+		return
 	}
-	a.RecomputeCallGate(now)
-	_ = s.db.Upsert(a)
+	if err := s.db.Mutate(a.ID, func(fresh *store.Account) error {
+		fn(fresh)
+		return nil
+	}); err != nil {
+		log.Printf("account mutate id=%s: %v", a.ID, err)
+	}
+	if fresh, err := s.db.Get(a.ID); err == nil && fresh != nil {
+		*a = *fresh
+	}
 }
 
 func isTransientRotate(errMsg string) bool {
@@ -145,10 +169,11 @@ func (s *Server) recordAccountRotate(a *store.Account, errMsg string) {
 	if a == nil {
 		return
 	}
-	a.LastUsedAt = time.Now()
-	a.LastError = ""
-	a.RecomputeCallGate(time.Now())
-	_ = s.db.Upsert(a)
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.LastUsedAt = time.Now()
+		fresh.LastError = ""
+		fresh.RecomputeCallGate(time.Now())
+	})
 	log.Printf("account rotate id=%s reason=%s", a.ID, friendlyLastError(errMsg))
 }
 
@@ -160,13 +185,14 @@ func (s *Server) recordAccountFail(a *store.Account, errMsg string) {
 		s.recordAccountRotate(a, errMsg)
 		return
 	}
-	a.LastUsedAt = time.Now()
-	a.FailCount++
-	if errMsg != "" {
-		a.LastError = friendlyLastError(errMsg)
-	}
-	a.RecomputeCallGate(time.Now())
-	_ = s.db.Upsert(a)
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.LastUsedAt = time.Now()
+		fresh.FailCount++
+		if errMsg != "" {
+			fresh.LastError = friendlyLastError(errMsg)
+		}
+		fresh.RecomputeCallGate(time.Now())
+	})
 }
 
 func (s *Server) softBanQuota(a *store.Account, reason, detail string) {
@@ -176,20 +202,17 @@ func (s *Server) softBanQuota(a *store.Account, reason, detail string) {
 	now := time.Now()
 	// 上游明确拒识 → 硬封禁；本地 remain=0 只标「透支中」仍可调。
 	if reason == "upstream_rejected" {
-		a.MarkUpstreamRejected(detail, now)
-		_ = s.db.Upsert(a)
+		s.applyAccountMutation(a, func(fresh *store.Account) { fresh.MarkUpstreamRejected(detail, now) })
 		log.Printf("account hard-ban upstream_rejected id=%s email=%s detail=%s", a.ID, a.Email, truncateStr(detail, 120))
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if _, err := s.refreshAccountQuota(ctx, a); err == nil {
-		a.RecomputeCallGate(now)
-		_ = s.db.Upsert(a)
+		s.applyAccountMutation(a, func(fresh *store.Account) { fresh.RecomputeCallGate(now) })
 		return
 	}
-	a.MarkQuotaExhausted(reason, detail, now)
-	_ = s.db.Upsert(a)
+	s.applyAccountMutation(a, func(fresh *store.Account) { fresh.MarkQuotaExhausted(reason, detail, now) })
 }
 
 // friendlyLastError turns Huawei/APIG payloads into a short pool status.
@@ -392,12 +415,10 @@ func peekModel(body []byte) string {
 	return payload.Model
 }
 
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
+// truncateStr 上游原文摘要的统一出口：先脱敏、再按字符边界截断。
+// 上游 401/403 响应体常回显 x-auth-token / access_key_id，这段文字会
+// 经 LastError 落进 accounts.json 并在面板展示；裸字节切还会切坏中文。
+func truncateStr(s string, n int) string { return kit.Snippet(s, n) }
 
 func (s *Server) StartQuotaSync(ctx context.Context) {
 	if s.huaweiModel != nil {
@@ -478,12 +499,17 @@ func (s *Server) handleDisableAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	a.Disabled = true
-	a.DisabledReason = "manual"
-	a.RecomputeCallGate(time.Now())
-	if err := s.db.Upsert(a); err != nil {
+	if err := s.db.Mutate(id, func(fresh *store.Account) error {
+		fresh.Disabled = true
+		fresh.DisabledReason = "manual"
+		fresh.RecomputeCallGate(time.Now())
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if fresh, gerr := s.db.Get(id); gerr == nil && fresh != nil {
+		a = fresh
 	}
 	writeJSON(w, http.StatusOK, redactAccount(a))
 }
@@ -495,18 +521,24 @@ func (s *Server) handleEnableAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	a.Disabled = false
-	if a.DisabledReason == "manual" || a.DisabledReason == "upstream_rejected" {
-		a.DisabledReason = ""
-		a.QuotaBlockedAt = time.Time{}
-	}
-	if a.Credentials != nil && a.Credentials.Usable() {
-		_, _ = s.refreshAccountQuota(r.Context(), a)
-	}
-	a.RecomputeCallGate(time.Now())
-	if err := s.db.Upsert(a); err != nil {
+	needQuota := a.Credentials != nil && a.Credentials.Usable()
+	if err := s.db.Mutate(id, func(fresh *store.Account) error {
+		fresh.Disabled = false
+		if fresh.DisabledReason == "manual" || fresh.DisabledReason == "upstream_rejected" {
+			fresh.DisabledReason = ""
+			fresh.QuotaBlockedAt = time.Time{}
+		}
+		fresh.RecomputeCallGate(time.Now())
+		return nil
+	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if fresh, gerr := s.db.Get(id); gerr == nil && fresh != nil {
+		a = fresh
+	}
+	if needQuota {
+		_, _ = s.refreshAccountQuota(r.Context(), a)
 	}
 	writeJSON(w, http.StatusOK, redactAccount(a))
 }
@@ -1385,6 +1417,13 @@ func (s *Server) pickAccountForSessionEx(valid []*store.Account, sessionID strin
 	if s.accountShard != nil {
 		s.accountShard.PromoteExpired(now)
 	}
+	// 粘性会话计数只取一次快照，供整轮候选评估复用：每个候选各调一次
+	// CountByAccount 会持 sticky 锁遍历整条 LRU（上限 8192），账号数一多
+	// 单次选号就是 O(账号×会话)，而且全部串行压在同一把锁上。
+	var stickCounts map[string]int
+	if s.sessionStick != nil {
+		stickCounts = s.sessionStick.CountByAccount()
+	}
 	for _, a := range valid {
 		if a == nil || tried[a.ID] {
 			continue
@@ -1430,7 +1469,10 @@ func (s *Server) pickAccountForSessionEx(valid []*store.Account, sessionID strin
 		if busy || draining || load >= s.accountCap(a) {
 			continue
 		}
-		c := cand{a: a, load: load, stick: s.stickCount(a.ID), recency: recency, priority: a.Priority}
+		// 粘性计数用循环外的一次快照：每候选调用一次 CountByAccount 会
+		// 持 sticky 锁遍历整条 LRU（上限 8192），358 个账号时单次选号就是
+		// 数百万次链表迭代 + 358 次 map 分配，全部串行压在选号路径上。
+		c := cand{a: a, load: load, stick: stickCounts[a.ID], recency: recency, priority: a.Priority}
 		if a.Depleted() {
 			if !depHavePri || c.priority < depMinPri {
 				depMinPri = c.priority
@@ -1601,19 +1643,17 @@ func (s *Server) noteAccountCache(a *store.Account, stickyHit bool, cachedTokens
 	if a == nil {
 		return
 	}
-	changed := false
+	var stickDelta int64
 	if stickyHit {
-		a.StickHits++
-		changed = true
+		stickDelta = 1
 	}
-	if cachedTokens > 0 {
-		a.CachedTokens += cachedTokens
-		changed = true
-	}
-	if !changed {
+	if stickDelta == 0 && cachedTokens <= 0 {
 		return
 	}
-	_ = s.db.Upsert(a)
+	s.applyAccountMutation(a, func(fresh *store.Account) {
+		fresh.StickHits += stickDelta
+		fresh.CachedTokens += cachedTokens
+	})
 }
 
 // totalInFlight sums live in-flight chat requests across all accounts, plus the

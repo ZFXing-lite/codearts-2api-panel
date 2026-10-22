@@ -11,10 +11,14 @@ func redactAccount(src *store.Account) *store.Account {
 	cp := *src
 	cp.Password = ""
 	cp.RefreshToken = ""
+	// 国内码道的 AccessToken 就是 cloud_dragon_token（上游 x-auth-token），
+	// 漏掉它等于把 CN 账号的 Bearer 明文吐给面板/API。
+	cp.AccessToken = ""
 	if src.Metadata != nil {
 		cp.Metadata = make(map[string]string, len(src.Metadata))
 		for k, v := range src.Metadata {
-			if k == "user_token" || k == "access_token" || k == "refresh_token" {
+			if k == "user_token" || k == "access_token" || k == "refresh_token" ||
+				k == "cn_code_verifier" || k == "cloud_dragon_token" {
 				continue
 			}
 			cp.Metadata[k] = v

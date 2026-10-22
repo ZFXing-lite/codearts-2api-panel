@@ -105,27 +105,34 @@ func (s *Server) handleBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		switch action {
 		case "disable":
-			a.Disabled = true
-			a.DisabledReason = "manual"
-			a.RecomputeCallGate(now)
-			if err := s.db.Upsert(a); err != nil {
+			if err := s.db.Mutate(id, func(fresh *store.Account) error {
+				fresh.Disabled = true
+				fresh.DisabledReason = "manual"
+				fresh.RecomputeCallGate(now)
+				return nil
+			}); err != nil {
 				it.Error = err.Error()
 				break
 			}
 			it.OK = true
 		case "enable":
-			a.Disabled = false
-			if a.DisabledReason == "manual" || a.DisabledReason == "upstream_rejected" {
-				a.DisabledReason = ""
-				a.QuotaBlockedAt = time.Time{}
-			}
-			if a.Credentials != nil && a.Credentials.Usable() {
-				_, _ = s.refreshAccountQuota(r.Context(), a)
-			}
-			a.RecomputeCallGate(time.Now())
-			if err := s.db.Upsert(a); err != nil {
+			needQuota := a.Credentials != nil && a.Credentials.Usable()
+			if err := s.db.Mutate(id, func(fresh *store.Account) error {
+				fresh.Disabled = false
+				if fresh.DisabledReason == "manual" || fresh.DisabledReason == "upstream_rejected" {
+					fresh.DisabledReason = ""
+					fresh.QuotaBlockedAt = time.Time{}
+				}
+				fresh.RecomputeCallGate(time.Now())
+				return nil
+			}); err != nil {
 				it.Error = err.Error()
 				break
+			}
+			if needQuota {
+				if fresh, gerr := s.db.Get(id); gerr == nil && fresh != nil {
+					_, _ = s.refreshAccountQuota(r.Context(), fresh)
+				}
 			}
 			it.OK = true
 		case "delete":
@@ -136,8 +143,10 @@ func (s *Server) handleBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			it.OK = true
 		case "refresh_quota":
 			if a.Credentials == nil || !a.Credentials.Usable() {
-				a.RecomputeCallGate(time.Now())
-				_ = s.db.Upsert(a)
+				_ = s.db.Mutate(id, func(fresh *store.Account) error {
+					fresh.RecomputeCallGate(time.Now())
+					return nil
+				})
 				it.Error = "no usable credentials"
 				break
 			}
@@ -147,9 +156,10 @@ func (s *Server) handleBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			it.OK = true
 		case "set_proxy":
-			a.ProxyID = proxyID
-			a.UpdatedAt = time.Now()
-			if err := s.db.Upsert(a); err != nil {
+			if err := s.db.Mutate(id, func(fresh *store.Account) error {
+				fresh.ProxyID = proxyID
+				return nil
+			}); err != nil {
 				it.Error = err.Error()
 				break
 			}
@@ -213,8 +223,7 @@ func (s *Server) handleBatchProxies(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, a := range s.db.List() {
 				if a.ProxyID == id {
-					a.ProxyID = ""
-					_ = s.db.Upsert(a)
+					s.applyAccountMutation(a, func(fresh *store.Account) { fresh.ProxyID = "" })
 				}
 			}
 			it.OK = true

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -430,6 +432,11 @@ type DB struct {
 	writeDone     chan struct{}
 	writeInterval time.Duration
 	fieldCipher   *FieldCipher
+
+	// lastWriteSum/hasLastWrite 记录自己最后一次落盘的内容哈希，
+	// 让热重载能区分"外部编辑"与"自己的异步写"，避免自我回滚。
+	lastWriteSum [32]byte
+	hasLastWrite bool
 }
 
 const defaultWriteInterval = 2 * time.Second
@@ -455,7 +462,16 @@ func Open(dataDir string) (*DB, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err == nil {
-		_ = json.Unmarshal(data, db)
+		// 解析失败绝不能当成"空库"继续跑：下一次 Upsert 会用空 map 覆盖
+		// 整个 accounts.json，全部凭证永久丢失。宁可起不来，并把坏文件
+		// 挪到一边留给运维，也不要静默毁数据。
+		if uerr := json.Unmarshal(data, db); uerr != nil {
+			bad := path + ".corrupt-" + time.Now().Format("20060102-150405")
+			_ = os.Rename(path, bad)
+			return nil, fmt.Errorf("accounts.json 解析失败（已备份到 %s）: %w", bad, uerr)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	if db.Accounts == nil {
 		db.Accounts = map[string]*Account{}
@@ -541,11 +557,68 @@ func (db *DB) saveLocked() error {
 	if err != nil {
 		return err
 	}
+	// 落盘必须扛住掉电：写临时文件 → fsync → 轮转 .bak → rename → fsync 目录。
+	// 只做 tmp+rename 的话，掉电可能留下 0 字节的 accounts.json（rename 的
+	// 元数据可能先于数据落盘），而那是全部凭证的唯一副本。
 	tmp := db.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil { // 0600 — only owner can read
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, db.path)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// 上一版留一份 .bak，损坏时还有一次回头路。
+	if _, statErr := os.Stat(db.path); statErr == nil {
+		_ = copyFile(db.path, db.path+".bak")
+	}
+	if err := os.Rename(tmp, db.path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// rename 本身也是目录项变更，目录 fsync 之后才算真正落地。
+	if dir, derr := os.Open(filepath.Dir(db.path)); derr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	// 记住自己写出去的内容：热重载 watcher 看到 mtime 变化时，
+	// 用它区分"外部手工编辑"与"自己的异步落盘"，避免自我回滚。
+	db.lastWriteSum = sha256.Sum256(data)
+	db.hasLastWrite = true
+	return nil
+}
+
+// copyFile 尽力拷贝（备份失败不阻断主流程）。
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // ReloadFromDisk re-reads accounts.json and atomically swaps the in-memory
@@ -557,6 +630,16 @@ func (db *DB) ReloadFromDisk() error {
 	data, err := os.ReadFile(db.path)
 	if err != nil {
 		return err
+	}
+	// 自写抑制：saveLocked 每 2 秒可能落一次盘，watcher 会看到 mtime 变化。
+	// 若内容与自己刚写的一致就直接返回，否则热重载会用磁盘快照整体替换内存，
+	// 把这两秒内新产生的续期 token/签到标记/禁用状态全部回滚掉。
+	sum := sha256.Sum256(data)
+	db.mu.Lock()
+	same := db.hasLastWrite && sum == db.lastWriteSum
+	db.mu.Unlock()
+	if same {
+		return nil
 	}
 	// Decode into a throwaway struct — never touch live db.Accounts on parse err.
 	type diskSnapshot struct {
@@ -591,19 +674,26 @@ func (db *DB) List() []*Account {
 	defer db.mu.Unlock()
 	out := make([]*Account, 0, len(db.Accounts))
 	for _, a := range db.Accounts {
-		out = append(out, a)
+		if a == nil {
+			continue
+		}
+		out = append(out, deepCopyAccount(a))
 	}
 	return out
 }
 
+// Get 返回账号副本。调用方拿到的指针与库内状态解耦：并发写盘时
+// json.Marshal 会遍历库内 map，若把活指针交出去、调用方在锁外改字段，
+// 就是 Go 运行时的 fatal concurrent map read/write（recover 拦不住）。
+// 要改账号一律走 Mutate。
 func (db *DB) Get(id string) (*Account, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	a, ok := db.Accounts[id]
-	if !ok {
+	if !ok || a == nil {
 		return nil, errors.New("account not found")
 	}
-	return a, nil
+	return deepCopyAccount(a), nil
 }
 
 // FindByEmail returns the first account matching email (case-insensitive).
@@ -615,8 +705,8 @@ func (db *DB) FindByEmail(email string) *Account {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	for _, a := range db.Accounts {
-		if strings.ToLower(strings.TrimSpace(a.Email)) == email {
-			return a
+		if a != nil && strings.ToLower(strings.TrimSpace(a.Email)) == email {
+			return deepCopyAccount(a)
 		}
 	}
 	return nil
@@ -890,10 +980,13 @@ func (db *DB) Mutate(id string, fn func(*Account) error) error {
 	if fn == nil {
 		return nil
 	}
-	// 备份轻量以便回滚（不深拷贝——fn 不允许新增指针对象的副作用）
-	bak := *a
+	// 深拷贝回滚：浅拷贝只保住标量，fn 里改过的 Metadata/Credentials/Quota
+	// 会留在库内。恢复时也原地写回，不换指针身份——外部可能仍持有它。
+	bak := deepCopyAccount(a)
 	if err := fn(a); err != nil {
-		db.Accounts[id] = &bak
+		if bak != nil {
+			*a = *bak
+		}
 		return err
 	}
 	a.UpdatedAt = time.Now()

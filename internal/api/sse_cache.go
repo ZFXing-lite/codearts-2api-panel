@@ -1993,9 +1993,17 @@ func newIdleTimeoutReader(r io.Reader, idle time.Duration) *idleTimeoutReader {
 	return &idleTimeoutReader{r: r, idle: idle}
 }
 
+// Read 用看门狗实现空闲超时。
+//
+// 不能靠 `r.r.(interface{ SetReadDeadline })`：resp.Body 的实际类型是
+// *http.bodyEOFSignal，它不实现这个方法，断言永远失败，于是退化成裸读，
+// errSSEIdleTimeout 一次都不会产生，SSE_IDLE_TIMEOUT 形同虚设。上游
+// TCP 活着但不吐字节（排队 / APIG 假死）时，请求会一直占着并发槽、
+// 账号 in-flight 租约和一条 goroutine，streamingWallLimit 也检查不到
+// （它只在每轮尝试开头执行，卡在 Read 里根本走不到）。
 func (r *idleTimeoutReader) Read(p []byte) (int, error) {
-	// Prefer deadline on the underlying conn — no per-Read goroutine tax.
 	if d, ok := r.r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		// 真能设 deadline 的就走快路径，没有每读一次的 goroutine 开销。
 		_ = d.SetReadDeadline(time.Now().Add(r.idle))
 		n, err := r.r.Read(p)
 		if n > 0 {
@@ -2008,8 +2016,39 @@ func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 		}
 		return n, err
 	}
-	// Fallback: plain read (client cancel / upstream EOF still terminate).
-	return r.r.Read(p)
+	// 看门狗路径：读在独立 goroutine 里，超时就关底层让读退出。
+	// 返回值里 err 是超时本身；n 必须是 0，不能把后面的数据带出来。
+	n, err, timedOut := readWithIdleTimeout(r.r, p, r.idle)
+	if timedOut {
+		return 0, errSSEIdleTimeout
+	}
+	return n, err
+}
+
+// readWithIdleTimeout 在独立 goroutine 里做一次 Read，超时则关闭底层。
+// 关闭是必须的：否则那个 goroutine 会一直挂在 Read 上不退出。
+func readWithIdleTimeout(r io.Reader, p []byte, idle time.Duration) (int, error, bool) {
+	type res struct {
+		n   int
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		n, err := r.Read(p)
+		done <- res{n, err}
+	}()
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	select {
+	case out := <-done:
+		return out.n, out.err, false
+	case <-timer.C:
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+		}
+		// 关闭后 goroutine 会返回，缓冲通道保证它不会泄漏。
+		return 0, errSSEIdleTimeout, true
+	}
 }
 
 func consumeSSE(ctx context.Context, src io.Reader, emit func(payload string) error) (*sseAssembly, error) {
