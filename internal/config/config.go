@@ -70,6 +70,10 @@ type Config struct {
 	CNWatchPoll         time.Duration // watchdog poll cycle
 	CNRefreshSkew       time.Duration // refresh token this early before expiration
 	CNUpstreamTimeout   time.Duration
+	// CNOAuthCallbackHost 可选：反向代理暴露的公网回调入口（如
+	// https://panel.example.com:443）。只有显式写了端口才改写授权链接里的
+	// port 参数；不写端口保持本机 127.0.0.1 回调不变。
+	CNOAuthCallbackHost string
 
 	// RespCacheTTL enables the local identical-body response cache. Default 5m.
 	// Covers both streaming and non-streaming: identical sanitized request bodies
@@ -135,6 +139,7 @@ func Get() Config {
 		CNWatchPoll:         envDuration("CN_WATCH_POLL", 30*time.Minute),
 		CNRefreshSkew:       envDuration("CN_REFRESH_SKEW", 30*time.Minute),
 		CNUpstreamTimeout:   envDuration("CN_UPSTREAM_TIMEOUT", 120*time.Second),
+		CNOAuthCallbackHost: envOr("CN_OAUTH_CALLBACK_HOST", ""),
 	}
 	if cfg.PublicURL == "" {
 		cfg.PublicURL = "http://localhost:" + cfg.Port

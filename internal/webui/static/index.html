@@ -212,7 +212,33 @@
         </div>
       </div>
       <div class="card">
-        <h3>如何新增国内账号</h3>
+        <h3>新增账号（面板直接登录）</h3>
+        <div class="muted" style="margin-bottom:10px">
+          点「生成登录链接」→ 浏览器打开链接用华为云账号登录。<br>
+          同机浏览器会自动完成；跨机器时登录后跳转的 <code>127.0.0.1</code> 页面打不开是正常的，
+          把地址栏那条 URL 整段粘到下面的「粘贴回调地址」即可。
+        </div>
+        <div class="row">
+          <input id="cn-login-port" placeholder="回调端口（默认当前页面端口）" style="width:200px">
+          <button class="btn primary" id="cn-login-start">生成登录链接</button>
+          <button class="btn ghost" id="cn-login-cancel" style="display:none">取消</button>
+        </div>
+        <div id="cn-login-box" style="display:none;margin-top:12px">
+          <div class="row" style="margin-bottom:8px">
+            <input id="cn-login-url" readonly style="flex:1;min-width:280px;font-family:ui-monospace,monospace;font-size:11px">
+            <button class="btn" id="cn-login-open">打开</button>
+            <button class="btn" id="cn-login-copy">复制</button>
+          </div>
+          <div class="row">
+            <input id="cn-login-paste" placeholder="粘贴浏览器地址栏里那条 127.0.0.1 回调 URL（跨机器时必填）" style="flex:1;min-width:280px">
+            <button class="btn" id="cn-login-submit">提交回调</button>
+          </div>
+          <div class="muted" id="cn-login-status" style="margin-top:10px">等待中…</div>
+        </div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>如何用命令行新增国内账号</h3>
         <div class="muted" style="line-height:1.9">
           国内码道是 OAuth 体系，与「国际版账户池」的邮箱+AK/SK 完全不同：<br>
           1. 服务器执行 <code>cnlogin -auth-dir ./auths</code>，扫码或打开打印的链接授权（会写入 <code>auths/codearts-*.json</code>）<br>

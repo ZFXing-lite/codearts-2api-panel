@@ -114,6 +114,7 @@ type Server struct {
 	cnClient *cnup.Client
 	cnSemaMu sync.Mutex
 	cnSema   map[string]chan struct{} // accountID -> per-account in-flight slots
+	cnLogins *cnLoginStore            // 面板内置 OAuth 登录会话（cnlogin.go）
 
 	// Cached chat HTTP clients per (direct/proxy) key — avoids per-request
 	// transport clone that defeated connection pooling (BUG-7 fix).
@@ -172,6 +173,7 @@ func New(cfg config.Config, db *store.DB, authMgr *auth.Manager, proxies *proxyp
 		circuit:         newCircuitBreaker(),
 		rateLimit:       newRateLimiter(0), // 0 = disabled by default
 		keyGate:         newKeyGate(cfg.KeyRPM, cfg.KeyMaxInFlight),
+		cnLogins:        newCNLoginStore(),
 		chatSem:         make(chan struct{}, chatSemCap(db)), // dynamic: 24 per account, min32 max1024 (see chatSemCap); fixed at boot, does not grow if accounts are added later
 		chatClients:     newChatClientCache(),                // cached transport variants — connection pool reuse (BUG-7 fix)
 		dispatchLimiter: newDispatchLimiter(float64(cfg.HuaweiDispatchRPS)),
@@ -332,7 +334,9 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("POST /api/accounts/quota/refresh-all", s.handleRefreshAllQuotas)
 	mux.HandleFunc("GET /api/oauth/start", s.handleOAuthStart)
 	mux.HandleFunc("GET /api/oauth/status", s.handleOAuthStatus)
-	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
+	// 该路径被国际版 OAuth 与国内码道共用：国内有活跃会话时按 CN 处理，
+	// 否则回退国际版提示页（见 cnlogin.go）。
+	mux.HandleFunc("GET /oauth/callback", s.handleCNOAuthCallback)
 
 	mux.HandleFunc("GET /api/proxies", s.handleListProxies)
 	mux.HandleFunc("POST /api/proxies", s.handleCreateProxy)
@@ -350,6 +354,10 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("GET /api/models/catalog", s.handleModelsCatalog)
 	mux.HandleFunc("GET /api/cn/dashboard", s.handleCNDashboard)
 	mux.HandleFunc("POST /api/cn/import", s.handleCNImport)
+	// 面板内置 OAuth 登录（cnlogin.go）：发起 → 轮询 → 粘贴回调兜底
+	mux.HandleFunc("POST /api/cn/login/start", s.handleCNLoginStart)
+	mux.HandleFunc("GET /api/cn/login/status", s.handleCNLoginStatus)
+	mux.HandleFunc("POST /api/cn/login/callback", s.handleCNLoginCallbackPaste)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/refresh", s.handleCNRefresh)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/checkin", s.handleCNCheckin)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/relogin-clear", s.handleCNReloginClear)

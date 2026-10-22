@@ -15,9 +15,9 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
+	"go-codearts/internal/cnauth"
 	"go-codearts/internal/cnup"
 	"go-codearts/internal/cnwatch"
 	"go-codearts/internal/store"
@@ -365,6 +365,5 @@ func cnBoolZh(b bool) string {
 	return "已关闭"
 }
 
-func cnIsAuthFile(name string) bool {
-	return strings.HasPrefix(name, "codearts-") && strings.HasSuffix(name, ".json")
-}
+// cnIsAuthFile 复用 cnauth 判定，避免与 CLI 的命名规则漂移。
+func cnIsAuthFile(name string) bool { return cnauth.IsAuthFile(name) }

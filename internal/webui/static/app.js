@@ -1898,6 +1898,236 @@ $("px-import-btn")?.addEventListener("click", async () => {
   }
 });
 
+let _cnCache = null;
+
+function cnTokenBadge(v) {
+  const map = {
+    ok: ["bg", "正常"],
+    due: ["bo", "将到期"],
+    expired: ["br", "已过期"],
+    none: ["bb", "无"],
+  };
+  const [cls, label] = map[v.token_state] || ["bb", v.token_state || "—"];
+  const exp = v.token_expires ? `<div class="muted" style="font-size:11px">${esc(fmtTime(v.token_expires))}</div>` : "";
+  return `<span class="badge ${cls}">${label}</span>${exp}`;
+}
+
+async function loadCN() {
+  let d;
+  try {
+    d = await api("/api/cn/dashboard");
+  } catch (e) {
+    toast("CN 状态加载失败: " + e.message);
+    return;
+  }
+  _cnCache = d;
+
+  $("cn-off-tip").style.display = d.enabled ? "none" : "block";
+  $("cn-sub").textContent =
+    `账号 ${d.accounts || 0} · 可调用 ${d.callable || 0} · 待重登 ${d.needs_relogin || 0}` +
+    ` · Token 临期 ${d.token_due || 0} · 今日签到 ${d.checkin_today || 0}` +
+    (d.last_active ? ` · 最近活动 ${fmtTime(d.last_active)}` : "");
+
+  const cards = [
+    { icon: "🀄", bg: "rgba(210,153,34,.12)", val: d.enabled ? "已启用" : "已关闭", key: "CN 渠道", trend: `auths ${d.auth_file_count || 0} 个凭证` },
+    { icon: "👥", bg: "rgba(78,168,255,.12)", val: d.accounts || 0, key: "CN 账号", trend: `可调用 ${d.callable || 0}` },
+    { icon: "🔑", bg: "rgba(248,81,73,.12)", val: d.needs_relogin || 0, key: "待重新登录", trend: `Token 临期 ${d.token_due || 0}` },
+    { icon: "🎁", bg: "rgba(63,185,80,.12)", val: `${d.checkin_today || 0}/${d.accounts || 0}`, key: "今日已签到", trend: d.today || "" },
+  ];
+  $("cn-stats").innerHTML = cards
+    .map((c) =>
+      `<div class="stat"><div class="icon" style="background:${c.bg}">${c.icon}</div>` +
+      `<div class="val">${esc(c.val)}</div><div class="key">${esc(c.key)}</div>` +
+      `<div class="trend">${esc(c.trend || "")}</div></div>`)
+    .join("");
+
+  $("cn-acct-count").textContent = `(${d.accounts || 0})`;
+  const rows = (d.account_views || []).map((v) => {
+    const gate = `<span class="badge ${v.call_gate === "ready" ? "bg" : (v.call_gate === "quota_exhausted" ? "bo" : "bb")}">${esc(v.call_gate || "—")}</span>` +
+      (v.needs_relogin ? ` <span class="badge br">需重登</span>` : "") +
+      (v.disabled ? ` <span class="badge bb">已禁用</span>` : "");
+    const errLine = v.last_error ? `<div class="muted" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.last_error)}">${esc(v.last_error)}</div>` : "";
+    const checkin = v.checkin_date
+      ? `<span class="badge bg">✓ ${esc(v.checkin_date)}</span><div class="muted" style="font-size:11px" title="${esc(v.checkin_msg || "")}">${esc(v.checkin_msg || "")}</div>`
+      : `<span class="badge bb">未签</span>`;
+    return `<tr>
+      <td><div class="email" title="${esc(v.email)}">${esc(v.email || v.id)}</div>${errLine}</td>
+      <td class="nowrap"><span class="muted" style="font-size:11px">${esc(v.user_id || "—")}</span></td>
+      <td>${gate}</td>
+      <td>${cnTokenBadge(v)}</td>
+      <td>${checkin}</td>
+      <td class="nowrap">${esc(fmtTime(v.last_active || v.last_keepalive || ""))}</td>
+      <td class="nowrap"><span class="badge bg">${v.success_count || 0}</span> / <span class="badge ${v.fail_count ? "br" : "bb"}">${v.fail_count || 0}</span></td>
+      <td class="nowrap">
+        <div class="ops">
+          <button class="btn sm" onclick="cnRefreshToken('${esc(v.id)}')">续期</button>
+          <button class="btn sm" onclick="cnCheckin('${esc(v.id)}')">签到</button>
+          ${v.needs_relogin ? `<button class="btn sm" onclick="cnClearRelogin('${esc(v.id)}')">清重登标记</button>` : ""}
+        </div>
+      </td>
+    </tr>`;
+  });
+  $("cn-acct-body").innerHTML = rows.length
+    ? rows.join("")
+    : `<tr><td colspan="8" class="empty">暂无 CN 账号。用 <code>cnlogin</code> 登录后点「导入 auths 目录」，或把 auths/*.json 放进 CN_AUTH_DIR。</td></tr>`;
+
+  const models = d.models || [];
+  $("cn-models").innerHTML = models.length
+    ? models.map((m) =>
+        `<span class="usage-pill" title="${esc(m.id)} · ${m.accounts} 个账号可用">` +
+        `<b>${esc(m.prefixed)}</b>${m.benefit ? ' <span class="badge bo">福利</span>' : ""}` +
+        ` <span class="muted">×${m.accounts}</span></span>`).join("")
+    : `<div class="empty">CN 账号尚未检出模型目录（首轮看护或任意一次 CN 请求后自动拉取）。</div>`;
+
+  $("cn-config").innerHTML = (d.config || [])
+    .map((c) => `<tr><td class="nowrap"><code>${esc(c.key)}</code></td><td>${esc(c.label)}</td><td class="nowrap">${esc(c.value || "—")}</td></tr>`)
+    .join("");
+}
+
+// ---------- 国内码道：面板内置 OAuth 登录 ----------
+let _cnLoginID = null;
+let _cnLoginTimer = null;
+
+function cnLoginReset() {
+  if (_cnLoginTimer) clearInterval(_cnLoginTimer);
+  _cnLoginTimer = null;
+  _cnLoginID = null;
+  const box = $("cn-login-box");
+  if (box) box.style.display = "none";
+  const cancel = $("cn-login-cancel");
+  if (cancel) cancel.style.display = "none";
+}
+
+async function cnLoginStart() {
+  const portEl = $("cn-login-port");
+  const port = Number((portEl && portEl.value) || location.port || 0);
+  const status = $("cn-login-status");
+  try {
+    const d = await api("/api/cn/login/start", {
+      method: "POST",
+      body: JSON.stringify({ port }),
+    });
+    _cnLoginID = d.session_id;
+    $("cn-login-box").style.display = "";
+    $("cn-login-cancel").style.display = "";
+    $("cn-login-url").value = d.auth_url || "";
+    if (status) status.textContent = d.hint || "等待浏览器完成授权…";
+    if (_cnLoginTimer) clearInterval(_cnLoginTimer);
+    _cnLoginTimer = setInterval(cnLoginPoll, 2000);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function cnLoginPoll() {
+  if (!_cnLoginID) return;
+  try {
+    const d = await api(`/api/cn/login/status?id=${encodeURIComponent(_cnLoginID)}`);
+    const status = $("cn-login-status");
+    if (d.status === "done") {
+      const a = d.account || {};
+      cnLoginReset();
+      if (status) status.textContent = `登录成功：${a.name || a.uid || ""}（凭据已入库）`;
+      toast("国内码道账号已添加");
+      loadCN();
+    } else if (d.status === "error") {
+      if (status) status.textContent = "登录失败：" + (d.message || "");
+      if (_cnLoginTimer) clearInterval(_cnLoginTimer);
+      _cnLoginTimer = null;
+    } else if (d.status === "expired") {
+      cnLoginReset();
+      if (status) status.textContent = d.message || "会话已过期，请重新生成链接";
+    } else if (d.message && status) {
+      status.textContent = d.message;
+    }
+  } catch (_) {}
+}
+
+async function cnLoginSubmit() {
+  const paste = ($("cn-login-paste").value || "").trim();
+  if (!_cnLoginID) return toast("先点「生成登录链接」");
+  if (!paste) return toast("请粘贴浏览器地址栏里的回调 URL");
+  try {
+    const d = await api(`/api/cn/login/callback?id=${encodeURIComponent(_cnLoginID)}`, {
+      method: "POST",
+      body: JSON.stringify({ callback_url: paste }),
+    });
+    $("cn-login-paste").value = "";
+    const status = $("cn-login-status");
+    if (d.next_url) {
+      if (status) status.textContent = d.message || "回调已接收";
+      window.open(d.next_url, "_blank", "noopener");
+    } else if (d.status === "done") {
+      const a = d.account || {};
+      cnLoginReset();
+      toast(`登录成功：${a.name || a.uid || ""}`);
+      loadCN();
+    } else if (status) {
+      status.textContent = d.message || "已提交";
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function cnImportAuths() {
+  try {
+    const r = await api("/api/cn/import", { method: "POST", body: "{}" });
+    toast(`已导入 ${r.imported || 0} 个 CN 账号`);
+    await loadCN();
+  } catch (e) {
+    toast("导入失败: " + e.message);
+  }
+}
+
+async function cnRefreshToken(id) {
+  try {
+    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/refresh`, { method: "POST", body: "{}" });
+    toast("续期成功，到期 " + fmtTime(r.token_expires || ""));
+  } catch (e) {
+    toast("续期失败: " + e.message);
+  }
+  loadCN();
+}
+
+async function cnCheckin(id) {
+  try {
+    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/checkin`, { method: "POST", body: "{}" });
+    toast(`签到完成：${r.message || "ok"}${r.credits ? ` · +${r.credits} 积分` : ""}`);
+  } catch (e) {
+    toast("签到失败: " + e.message);
+  }
+  loadCN();
+}
+
+async function cnClearRelogin(id) {
+  try {
+    await api(`/api/cn/accounts/${encodeURIComponent(id)}/relogin-clear`, { method: "POST", body: "{}" });
+    toast("已清除重登标记");
+  } catch (e) {
+    toast("操作失败: " + e.message);
+  }
+  loadCN();
+}
+
+$("cn-login-start")?.addEventListener("click", cnLoginStart);
+$("cn-login-cancel")?.addEventListener("click", cnLoginReset);
+$("cn-login-submit")?.addEventListener("click", cnLoginSubmit);
+$("cn-login-paste")?.addEventListener("keydown", (e) => { if (e.key === "Enter") cnLoginSubmit(); });
+$("cn-login-open")?.addEventListener("click", () => {
+  const u = $("cn-login-url")?.value;
+  if (u) window.open(u, "_blank", "noopener");
+});
+$("cn-login-copy")?.addEventListener("click", async () => {
+  const u = $("cn-login-url")?.value || "";
+  try {
+    await navigator.clipboard.writeText(u);
+    toast("链接已复制");
+  } catch (_) {
+    $("cn-login-url")?.select();
+    toast("已选中，按 Ctrl/Cmd+C 复制");
+  }
+});
 bindSortableHeaders("accounts-table", acctSortValue, renderAccounts);
 bindSortableHeaders("proxies-table", proxySortValue, renderProxiesTable);
 bindSortableHeaders("apikeys-table", apikeySortValue, renderAPIKeysTable);

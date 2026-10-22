@@ -7,12 +7,13 @@ import (
 	"strings"
 	"testing"
 
+	"go-codearts/internal/cnauth"
 	"go-codearts/internal/cnup"
 )
 
 // 文件名生成对齐 codearts2api 约定：codearts-{user_id}.json。
 func TestFileName(t *testing.T) {
-	if got := fileName("u123"); got != "codearts-u123.json" {
+	if got := cnauth.FileName("u123"); got != "codearts-u123.json" {
 		t.Fatalf("fileName = %q", got)
 	}
 }
@@ -54,7 +55,7 @@ func TestBuildAuthorizeURL(t *testing.T) {
 // 落盘 schema：字段名与 codearts2api-cn/internal/auth 一致，且能 round-trip。
 func TestSaveAuthSchema(t *testing.T) {
 	dir := t.TempDir()
-	a := &authFile{
+	a := &cnauth.File{
 		UserID:          "uid1",
 		UserName:        "n",
 		DomainID:        "d",
@@ -68,9 +69,9 @@ func TestSaveAuthSchema(t *testing.T) {
 		ClientID:        "cid",
 		DPoPPrivateKey:  map[string]string{"kty": "EC"},
 	}
-	path, err := saveAuth(dir, a)
+	path, err := cnauth.Save(dir, a)
 	if err != nil {
-		t.Fatalf("saveAuth: %v", err)
+		t.Fatalf("cnauth.Save: %v", err)
 	}
 	if filepath.Base(path) != "codearts-uid1.json" {
 		t.Fatalf("path = %s", path)

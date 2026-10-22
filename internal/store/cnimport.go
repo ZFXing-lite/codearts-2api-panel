@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go-codearts/internal/cnauth"
 )
 
 // Channel values.
@@ -23,26 +25,8 @@ func NormalizeChannel(ch string) string {
 	return strings.TrimSpace(ch)
 }
 
-// cnAuth mirrors codearts2api-cn auths/codearts-{user_id}.json on-disk shape.
-type cnAuth struct {
-	UserID          string `json:"user_id"`
-	UserName        string `json:"user_name"`
-	DomainID        string `json:"domain_id"`
-	CloudDragonTok  string `json:"cloud_dragon_token"` // = STS security_token / x-auth-token
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
-	Expiration      string `json:"expiration"` // RFC3339
-	RefreshToken    string `json:"refresh_token"`
-	CodeVerifier    string `json:"code_verifier"`
-	ClientID        string `json:"client_id,omitempty"`
-	UpdatedAt       int64  `json:"updated_at"`
-	// chat_id is not part of the upstream login payload; it may be present when
-	// the operator pins a conversation for 会话续接.
-	ChatID string `json:"chat_id,omitempty"`
-	// DPoPPrivateKey is the ES256 JWK the refresh_token is bound to (RFC 9449);
-	// refreshing with a different key gets rejected by STS.
-	DPoPPrivateKey map[string]string `json:"dpop_private_key,omitempty"`
-}
+// cnAuth 复用 cnauth.File：CLI、网关、面板三方共享同一份落盘 schema。
+type cnAuth = cnauth.File
 
 // ImportCNAuthDir scans dir for codearts-*.json login artifacts produced by
 // codearts2api and upserts them as Channel=cn accounts. Dedup is keyed by
