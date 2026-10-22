@@ -2388,7 +2388,15 @@ func asFloat(v any) float64 {
 
 // serveCachedAsProtoSSE replays a cached OpenAI completion as a streaming
 // response, translated to the client's protocol by protoStream.
+// serveCachedAsProtoSSE 把缓存里的 OpenAI 非流式响应体回放成目标协议的 SSE。
 func serveCachedAsProtoSSE(w http.ResponseWriter, body []byte, pin *ssePin) {
+	writeOpenAIAsProtoSSE(w, body, pin, true)
+}
+
+// writeOpenAIAsProtoSSE 把一份 OpenAI chat.completion 响应体渲染成目标协议的
+// SSE 帧序列。cacheHit=false 用于「上游只有 OpenAI 格式、但客户端要
+// Claude/Responses 流式」的直通场景——帧序列合法，只是整段生成完才发。
+func writeOpenAIAsProtoSSE(w http.ResponseWriter, body []byte, pin *ssePin, cacheHit bool) {
 	var obj map[string]any
 	if json.Unmarshal(body, &obj) != nil {
 		return
@@ -2427,7 +2435,9 @@ func serveCachedAsProtoSSE(w http.ResponseWriter, body []byte, pin *ssePin) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Cache", "HIT")
+	if cacheHit {
+		w.Header().Set("X-Cache", "HIT")
+	}
 	w.WriteHeader(http.StatusOK)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()

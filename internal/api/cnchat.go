@@ -100,6 +100,23 @@ func (s *Server) handleCNChat(ctx context.Context, w http.ResponseWriter, r *htt
 	// LastLatency / Depleted() 永远停在导入初值，面板显示"从未使用"，
 	// 选号也无法按真实余额倾斜；按 key 的 token 配额同样记 0。
 	var cnPrompt, cnCompletion, cnTotal float64
+	if wantStream && proto != protoChat {
+		// CN 上游只会吐 OpenAI 格式 SSE。Claude(/v1/messages) 与
+		// Responses(/v1/responses) 客户端要的是各自的帧序列，之前这里
+		// 直接返回一次性 application/json，SDK 会报
+		// "stream ended without message_start" —— 该渠道对这两个协议整体不可用。
+		// 这里先聚合、再按目标协议回放：帧序列合法，代价是整段生成完才发。
+		cnAgg, cnErr := cnup.AggregateRaw(rc)
+		if cnErr != nil {
+			log.Printf("cn chat aggregate rid=%s account=%s err=%v", reqIDFromRequest(r), acc.ID, cnErr)
+			return true, false, false, false
+		}
+		cnPrompt, cnCompletion, cnTotal = cnUsageTokens(cnAgg)
+		s.recordAccountSuccessFull(acc, cnTotal, cnPrompt, cnCompletion, time.Since(cnStarted).Milliseconds())
+		cnBody, _ := json.Marshal(cnup.RenderOpenAI(cnAgg, model))
+		writeOpenAIAsProtoSSE(w, cnBody, &ssePin{Proto: proto, Model: model}, false)
+		return true, false, true, false
+	}
 	if wantStream && proto == protoChat {
 		serr := cnup.StreamCaptureWithUsage(w, rc, model, func(fin *cnup.RawCompletion) {
 			cnPrompt, cnCompletion, cnTotal = cnUsageTokens(fin)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -434,5 +435,39 @@ func TestAccountsChannelFilter(t *testing.T) {
 		if len(list) != tc.want {
 			t.Fatalf("%q: got %d accounts want %d", tc.query, len(list), tc.want)
 		}
+	}
+}
+
+// CN 渠道的 Claude / Responses 流式：上游只吐 OpenAI SSE，
+// 网关必须把它回放成目标协议的帧序列，不能退回一次性 JSON。
+func TestCNChatStreamsClaudeProtocol(t *testing.T) {
+	up := fakeCNUpstream(t)
+	defer up.Close()
+	_, ts, _ := newCNTestServer(t, up.URL, cnTestAccount("cn-1"))
+
+	body := `{"model":"cn:GLM-5.2","stream":true,"max_tokens":64,` +
+		`"messages":[{"role":"user","content":"你好"}]}`
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		ts.URL+"/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "event-stream") {
+		t.Fatalf("expected SSE for claude proto, got %q", ct)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	text := string(raw)
+	// Claude 流式必须带 message_start 与 message_stop，SDK 靠它们判断流边界。
+	if !strings.Contains(text, "message_start") {
+		t.Fatalf("missing message_start: %s", text)
+	}
+	if !strings.Contains(text, "message_stop") {
+		t.Fatalf("missing message_stop: %s", text)
 	}
 }
