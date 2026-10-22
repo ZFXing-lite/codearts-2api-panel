@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -24,13 +25,32 @@ import (
 
 // Metadata 键（账号 Account.Metadata）。
 const (
-	mdClientID       = "client_id"           // OAuth client_id（兼容旧导入）
-	mdClientIDLegacy = "cn_client_id"        // store/cnimport 写入的键
-	mdCodeVerifier   = "cn_code_verifier"    // PKCE verifier（刷新时必传）
-	mdDPoPKey        = "cn_dpop_private_key" // DPoPPrivateJWK 的 JSON 序列化
-	mdNeedsRelogin   = "cn_needs_relogin"    // refresh_token 终态失效标记
-	mdLastActive     = "cn_last_active"      // 最近一次 chat 活动时间（RFC3339）
-	mdLastKeepalive  = "cn_last_keepalive"   // 最近一次成功/尝试心跳时间
+	mdClientID       = "client_id"               // OAuth client_id（兼容旧导入）
+	mdClientIDLegacy = "cn_client_id"            // store/cnimport 写入的键
+	mdCodeVerifier   = "cn_code_verifier"        // PKCE verifier（刷新时必传）
+	mdDPoPKey        = "cn_dpop_private_key"     // DPoPPrivateJWK 的 JSON 序列化
+	mdNeedsRelogin   = "cn_needs_relogin"        // refresh_token 终态失效标记
+	mdLastActive     = "cn_last_active"          // 最近一次 chat 活动时间（RFC3339）
+	mdLastKeepalive  = "cn_last_keepalive"       // 最近一次成功/尝试心跳时间
+	mdCheckinDate    = "cn_last_checkin_date"    // 最近签到成功的上海日历日（2026-02-14）
+	mdCheckinMsg     = "cn_last_checkin_msg"     // 最近签到结果摘要（面板展示）
+	mdCheckinCredits = "cn_last_checkin_credits" // 最近签到获得积分
+	mdCheckinAt      = "cn_last_checkin_at"      // 最近签到时间戳（RFC3339）
+)
+
+// cnDay 以 Asia/Shanghai 日历日为准（签到日界与上游一致）。
+var cnDay = time.FixedZone("CST", 8*3600)
+
+func cnDateKey(t time.Time) string { return t.In(cnDay).Format("2006-01-02") }
+
+// mdCheckinDate 等键同时暴露给 api 包（面板读取）。
+const (
+	MetaCheckinDate  = mdCheckinDate
+	MetaCheckinMsg   = mdCheckinMsg
+	MetaCheckinAt    = mdCheckinAt
+	MetaLastActive   = mdLastActive
+	MetaLastPing     = mdLastKeepalive
+	MetaNeedsRelogin = mdNeedsRelogin
 )
 
 // Client 抽象 cnup.Client，便于测试注入假实现；*cnup.Client 天然满足。
@@ -233,16 +253,44 @@ func applyTokenResponse(acc *store.Account, res *cnup.TokenResponse) {
 	}
 }
 
-// checkin 每日签到 / 新手福利领取，结果只记日志。
+// checkin 每日签到 / 新手福利领取。结果落库到账号 Metadata，
+// 面板据此展示"今日已签"状态；本地闸门保证每账号每日只打一次上游。
 func (w *Watcher) checkin(ctx context.Context, acc *store.Account, cred cnup.SignCredential) {
-	res, err := w.client.Checkin(ctx, cred)
-	if err != nil {
-		log.Printf("cnwatch: %s: checkin failed: %v", acc.ID, err)
-		return
+	today := cnDateKey(w.now())
+	if acc.Metadata[mdCheckinDate] == today {
+		return // 今日已签，本地闸门拦住重复请求
 	}
-	if res.Message != "" || res.Credits > 0 {
+	res, err := w.client.Checkin(ctx, cred)
+	msg := ""
+	credits := res.Credits
+	if err != nil {
+		msg = err.Error()
+		log.Printf("cnwatch: %s: checkin failed: %v", acc.ID, err)
+	} else if res.Message != "" || res.Credits > 0 {
+		msg = res.Message
 		log.Printf("cnwatch: %s: checkin ok=%v credits=%g msg=%s", acc.ID, res.OK, res.Credits, res.Message)
 	}
+	// 落库：失败也记录 msg（不写日期，下一轮重试），成功写日期关闭今日闸门。
+	_ = w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata[mdCheckinAt] = w.now().Format(time.RFC3339)
+		fresh.Metadata[mdCheckinMsg] = truncate(msg, 200)
+		if err == nil {
+			fresh.Metadata[mdCheckinDate] = today
+			fresh.Metadata[mdCheckinCredits] = strconv.FormatFloat(credits, 'f', -1, 64)
+		}
+		return nil
+	})
+}
+
+// truncate 截断过长文案（Metadata 只存摘要）。
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // claimBenefit 限时福利领取（cnup 内置幂等便利方法）。

@@ -34,6 +34,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         账户池
       </a>
+      <a data-page="cn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        国内码道
+      </a>
       <a data-page="proxies">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="m4.9 4.9 2.1 2.1"/><path d="m17 17 2.1 2.1"/><path d="M2 12h3"/><path d="M19 12h3"/><path d="m4.9 19.1 2.1-2.1"/><path d="m17 7 2.1-2.1"/></svg>
         代理池
@@ -161,6 +165,8 @@
             <button type="button" class="seg-item" data-filter="ready">可调用</button>
             <button type="button" class="seg-item" data-filter="quota_exhausted">透支中</button>
             <button type="button" class="seg-item" data-filter="disabled">已禁用</button>
+            <button type="button" class="seg-item" data-filter="cn">国内码道</button>
+            <button type="button" class="seg-item" data-filter="intl">国际版</button>
           </div>
           <input id="acct-search" placeholder="搜索邮箱 / ID" style="min-width:200px">
           <button class="btn ghost" id="refresh-all-quota">
@@ -191,6 +197,51 @@
               </tr>
             </thead>
             <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="p-cn">
+      <div class="page-head">
+        <div><h2>国内码道</h2><div class="sub" id="cn-sub">盘古助手渠道 · OAuth 账号 · 每日签到 · 看护续期</div></div>
+        <div class="row" style="gap:8px">
+          <button class="btn" onclick="cnImportAuths()">⤓ 导入 auths 目录</button>
+          <button class="btn" onclick="loadCN()">↻ 刷新</button>
+        </div>
+      </div>
+      <div id="cn-off-tip" class="card" style="display:none;border-color:rgba(248,81,73,.35)">
+        <h3 style="color:var(--red)">CN 渠道已关闭（CN_ENABLED=false）</h3>
+        <div class="muted">国内码道账号不会进入调度池。改 <code>.env</code> 中 <code>CN_ENABLED=true</code> 并重启/热加载后生效。</div>
+      </div>
+      <div class="grid grid-4" id="cn-stats"></div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>CN 账号 <span class="muted" id="cn-acct-count"></span></h3>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th>账号</th><th>UserID</th><th>状态</th><th>Token</th>
+                <th>今日签到</th><th>最近活动</th><th>成 / 败</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="cn-acct-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>CN 模型目录 <span class="muted">（cn: 前缀可在 /v1/models 或请求 model 字段直接用）</span></h3>
+        <div id="cn-models" class="usage-strip"></div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>运行参数快照 <span class="muted">（.env 只读，改动需重启/热加载）</span></h3>
+        <div class="tbl-wrap">
+          <table class="tbl cn-cfg">
+            <thead><tr><th>变量</th><th>含义</th><th>当前值</th></tr></thead>
+            <tbody id="cn-config"></tbody>
           </table>
         </div>
       </div>

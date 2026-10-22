@@ -523,6 +523,15 @@ func (s *Server) handleRefreshAllQuotas(w http.ResponseWriter, r *http.Request) 
 	out := make([]item, 0, len(list))
 	for _, a := range list {
 		it := item{ID: a.ID, Email: a.Email}
+		// CN 渠道没有国际 quota 体系（额度概念走积分/签到），
+		// 打国际 insight 接口只会失败并污染 LastError。
+		if store.NormalizeChannel(a.Channel) == store.ChannelCN {
+			a.RecomputeCallGate(time.Now())
+			it.Gate = a.CallGate
+			it.Error = "cn channel — 额度走签到/积分，不适用国际额度刷新"
+			out = append(out, it)
+			continue
+		}
 		if a.Credentials == nil || !a.Credentials.Usable() {
 			a.RecomputeCallGate(time.Now())
 			it.Gate = a.CallGate

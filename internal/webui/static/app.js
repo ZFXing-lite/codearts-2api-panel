@@ -220,6 +220,7 @@ function goPage(name) {
     loadDashboard();
   }
   if (name === "models") loadModels();
+  if (name === "cn") loadCN();
   if (name === "oauth") fillOAuthAccounts();
   if (name === "proxies") loadProxies();
   if (name === "apikeys") {
@@ -437,12 +438,13 @@ async function refreshAll(refreshQuota = false) {
   // Paint cached quota first. Waiting on 31 Huawei insight calls leaves
   // the overview/account table blank after every refresh.
   await Promise.all([loadDashboard(), loadAccounts()]);
+  if (document.querySelector("#p-cn")?.classList.contains("active")) loadCN();
   if (!refreshQuota) return;
   try {
     const list = _accountsCache || [];
     await Promise.allSettled(
       list
-        .filter((a) => a.credentials && a.credentials.access_key_id)
+        .filter((a) => a.channel !== "cn" && a.credentials && a.credentials.access_key_id)
         .map((a) => api(`/api/accounts/${a.id}/insight/refresh`, { method: "POST", body: "{}" }))
     );
     await Promise.all([loadDashboard(), loadAccounts()]);
@@ -470,8 +472,12 @@ async function loadDashboard() {
       : new Date().toLocaleTimeString();
   }
 
+  const cs = d.channel_stats || {};
+  const cnS = cs.cn || {}, intlS = cs.intl || {};
   $("ov-sub").textContent =
-    `账号 ${d.accounts || 0} · 可调用 ${d.callable || 0} · 透支中 ${d.quota_exhausted || 0} · 在途 ${inflight} · 粘滞 ${stickPct} · 更新 ${new Date(d.time || Date.now()).toLocaleString()}`;
+    `账号 ${d.accounts || 0} · 可调用 ${d.callable || 0} · 透支中 ${d.quota_exhausted || 0} · 在途 ${inflight} · 粘滞 ${stickPct}` +
+    ` · 国际 ${intlS.callable || 0}/${intlS.accounts || 0} · 国内码道 ${cnS.callable || 0}/${cnS.accounts || 0}` +
+    ` · 更新 ${new Date(d.time || Date.now()).toLocaleString()}`;
   if ($("acct-sub")) {
     $("acct-sub").textContent =
       `导入 txt / 手动添加 / Token 刷新 · 共 ${d.accounts || 0} 个账号全部列出`;
@@ -765,6 +771,8 @@ function renderAccounts() {
     if (_acctFilter === "ready" && !(g === "ready" || g === "quota_exhausted")) return false;
     if (_acctFilter === "quota_exhausted" && g !== "quota_exhausted") return false;
     if (_acctFilter === "disabled" && !(!!a.disabled || g === "disabled")) return false;
+    if (_acctFilter === "cn" && a.channel !== "cn") return false;
+    if (_acctFilter === "intl" && a.channel === "cn") return false;
     if (q) {
       const hay = `${a.email || ""} ${a.id || ""}`.toLowerCase();
       if (!hay.includes(q)) return false;
@@ -973,6 +981,133 @@ async function loadModels() {
   }
 }
 
+// ── 国内码道（CN 渠道）面板 ──────────────────────────────
+let _cnCache = null;
+
+function cnTokenBadge(v) {
+  const map = {
+    ok: ["bg", "正常"],
+    due: ["bo", "将到期"],
+    expired: ["br", "已过期"],
+    none: ["bb", "无"],
+  };
+  const [cls, label] = map[v.token_state] || ["bb", v.token_state || "—"];
+  const exp = v.token_expires ? `<div class="muted" style="font-size:11px">${esc(fmtTime(v.token_expires))}</div>` : "";
+  return `<span class="badge ${cls}">${label}</span>${exp}`;
+}
+
+async function loadCN() {
+  let d;
+  try {
+    d = await api("/api/cn/dashboard");
+  } catch (e) {
+    toast("CN 状态加载失败: " + e.message);
+    return;
+  }
+  _cnCache = d;
+
+  $("cn-off-tip").style.display = d.enabled ? "none" : "block";
+  $("cn-sub").textContent =
+    `账号 ${d.accounts || 0} · 可调用 ${d.callable || 0} · 待重登 ${d.needs_relogin || 0}` +
+    ` · Token 临期 ${d.token_due || 0} · 今日签到 ${d.checkin_today || 0}` +
+    (d.last_active ? ` · 最近活动 ${fmtTime(d.last_active)}` : "");
+
+  const cards = [
+    { icon: "🀄", bg: "rgba(210,153,34,.12)", val: d.enabled ? "已启用" : "已关闭", key: "CN 渠道", trend: `auths ${d.auth_file_count || 0} 个凭证` },
+    { icon: "👥", bg: "rgba(78,168,255,.12)", val: d.accounts || 0, key: "CN 账号", trend: `可调用 ${d.callable || 0}` },
+    { icon: "🔑", bg: "rgba(248,81,73,.12)", val: d.needs_relogin || 0, key: "待重新登录", trend: `Token 临期 ${d.token_due || 0}` },
+    { icon: "🎁", bg: "rgba(63,185,80,.12)", val: `${d.checkin_today || 0}/${d.accounts || 0}`, key: "今日已签到", trend: d.today || "" },
+  ];
+  $("cn-stats").innerHTML = cards
+    .map((c) =>
+      `<div class="stat"><div class="icon" style="background:${c.bg}">${c.icon}</div>` +
+      `<div class="val">${esc(c.val)}</div><div class="key">${esc(c.key)}</div>` +
+      `<div class="trend">${esc(c.trend || "")}</div></div>`)
+    .join("");
+
+  $("cn-acct-count").textContent = `(${d.accounts || 0})`;
+  const rows = (d.account_views || []).map((v) => {
+    const gate = `<span class="badge ${v.call_gate === "ready" ? "bg" : (v.call_gate === "quota_exhausted" ? "bo" : "bb")}">${esc(v.call_gate || "—")}</span>` +
+      (v.needs_relogin ? ` <span class="badge br">需重登</span>` : "") +
+      (v.disabled ? ` <span class="badge bb">已禁用</span>` : "");
+    const errLine = v.last_error ? `<div class="muted" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.last_error)}">${esc(v.last_error)}</div>` : "";
+    const checkin = v.checkin_date
+      ? `<span class="badge bg">✓ ${esc(v.checkin_date)}</span><div class="muted" style="font-size:11px" title="${esc(v.checkin_msg || "")}">${esc(v.checkin_msg || "")}</div>`
+      : `<span class="badge bb">未签</span>`;
+    return `<tr>
+      <td><div class="email" title="${esc(v.email)}">${esc(v.email || v.id)}</div>${errLine}</td>
+      <td class="nowrap"><span class="muted" style="font-size:11px">${esc(v.user_id || "—")}</span></td>
+      <td>${gate}</td>
+      <td>${cnTokenBadge(v)}</td>
+      <td>${checkin}</td>
+      <td class="nowrap">${esc(fmtTime(v.last_active || v.last_keepalive || ""))}</td>
+      <td class="nowrap"><span class="badge bg">${v.success_count || 0}</span> / <span class="badge ${v.fail_count ? "br" : "bb"}">${v.fail_count || 0}</span></td>
+      <td class="nowrap">
+        <div class="ops">
+          <button class="btn sm" onclick="cnRefreshToken('${esc(v.id)}')">续期</button>
+          <button class="btn sm" onclick="cnCheckin('${esc(v.id)}')">签到</button>
+          ${v.needs_relogin ? `<button class="btn sm" onclick="cnClearRelogin('${esc(v.id)}')">清重登标记</button>` : ""}
+        </div>
+      </td>
+    </tr>`;
+  });
+  $("cn-acct-body").innerHTML = rows.length
+    ? rows.join("")
+    : `<tr><td colspan="8" class="empty">暂无 CN 账号。用 <code>cnlogin</code> 登录后点「导入 auths 目录」，或把 auths/*.json 放进 CN_AUTH_DIR。</td></tr>`;
+
+  const models = d.models || [];
+  $("cn-models").innerHTML = models.length
+    ? models.map((m) =>
+        `<span class="usage-pill" title="${esc(m.id)} · ${m.accounts} 个账号可用">` +
+        `<b>${esc(m.prefixed)}</b>${m.benefit ? ' <span class="badge bo">福利</span>' : ""}` +
+        ` <span class="muted">×${m.accounts}</span></span>`).join("")
+    : `<div class="empty">CN 账号尚未检出模型目录（首轮看护或任意一次 CN 请求后自动拉取）。</div>`;
+
+  $("cn-config").innerHTML = (d.config || [])
+    .map((c) => `<tr><td class="nowrap"><code>${esc(c.key)}</code></td><td>${esc(c.label)}</td><td class="nowrap">${esc(c.value || "—")}</td></tr>`)
+    .join("");
+}
+
+async function cnImportAuths() {
+  try {
+    const r = await api("/api/cn/import", { method: "POST", body: "{}" });
+    toast(`已导入 ${r.imported || 0} 个 CN 账号`);
+    await loadCN();
+  } catch (e) {
+    toast("导入失败: " + e.message);
+  }
+}
+
+async function cnRefreshToken(id) {
+  try {
+    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/refresh`, { method: "POST", body: "{}" });
+    toast("续期成功，到期 " + fmtTime(r.token_expires || ""));
+  } catch (e) {
+    toast("续期失败: " + e.message);
+  }
+  loadCN();
+}
+
+async function cnCheckin(id) {
+  try {
+    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/checkin`, { method: "POST", body: "{}" });
+    toast(`签到完成：${r.message || "ok"}${r.credits ? ` · +${r.credits} 积分` : ""}`);
+  } catch (e) {
+    toast("签到失败: " + e.message);
+  }
+  loadCN();
+}
+
+async function cnClearRelogin(id) {
+  try {
+    await api(`/api/cn/accounts/${encodeURIComponent(id)}/relogin-clear`, { method: "POST", body: "{}" });
+    toast("已清除重登标记");
+  } catch (e) {
+    toast("操作失败: " + e.message);
+  }
+  loadCN();
+}
+
 async function fillOAuthAccounts() {
   const list = await api("/api/accounts");
   const sel = $("oauth-account");
@@ -1011,6 +1146,11 @@ async function refreshToken(id) {
 async function fetchQuota(id) {
   try {
     const d = await api(`/api/accounts/${id}/quota`);
+    // CN 渠道没有国际额度体系，后端返回说明文案
+    if (d.channel === "cn") {
+      toast(d.message || "国内码道渠道无国际额度");
+      return;
+    }
     const q = d.quota || {};
     const used = Number(q.used_tokens || 0);
     const total = Number(q.package_tokens || 0);

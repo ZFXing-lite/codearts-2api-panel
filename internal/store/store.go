@@ -242,6 +242,39 @@ func (a *Account) RecomputeCallGate(now time.Time) {
 		}
 		return
 	}
+	// CN 渠道（国内码道）走 OAuth：只需 access_token（cloud_dragon_token），
+	// 不依赖 IAM AK/SK。若仍套 Credentials 判据，纯 OAuth 导入的账号会永远
+	// no_cred → 整个国内渠道在调度池里恒空。
+	if NormalizeChannel(a.Channel) == ChannelCN {
+		if strings.TrimSpace(a.AccessToken) == "" {
+			a.CallGate = CallGateNoCred
+			return
+		}
+		// token 过期：有 refresh_token 就放行到 ready（chat 侧会 inline 续期，
+		// cnwatch 也会按 skew 兜底），否则判过期让运维重登。
+		if !a.TokenExpires.IsZero() && a.TokenExpires.Before(now) && a.RefreshToken == "" {
+			a.CallGate = CallGateTokenExpired
+			return
+		}
+		if a.Quota != nil && a.Quota.PackageLooksExpired(now) {
+			a.CallGate = CallGateExpired
+			return
+		}
+		if a.Quota != nil && !a.Quota.HasQuotaBudget() {
+			a.CallGate = CallGateQuotaExhausted
+			a.DisabledReason = "quota_exhausted"
+			if a.QuotaBlockedAt.IsZero() {
+				a.QuotaBlockedAt = now
+			}
+			return
+		}
+		if a.DisabledReason == "quota_exhausted" || a.DisabledReason == "expired" || a.DisabledReason == "upstream_rejected" {
+			a.DisabledReason = ""
+			a.QuotaBlockedAt = time.Time{}
+		}
+		a.CallGate = CallGateReady
+		return
+	}
 	if a.Credentials == nil || !a.Credentials.Usable() {
 		a.CallGate = CallGateNoCred
 		return

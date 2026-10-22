@@ -252,3 +252,87 @@ func TestCNChatNeedsReloginSkipped(t *testing.T) {
 		t.Fatalf("response must stay untouched, got %d", rec.Code)
 	}
 }
+
+// 面板「国内码道」页聚合：CN 账号必须可调用（只需 access_token）、
+// 待重登/签到状态正确透出，且与渠道统计口径一致。
+func TestCNDashboardAggregates(t *testing.T) {
+	up := fakeCNUpstream(t)
+	defer up.Close()
+	acc := &store.Account{
+		ID: "cn-9", Channel: store.ChannelCN, Email: "cn@panel.local",
+		UserID: "uid-9", AccessToken: "tok", RefreshToken: "rt",
+		Metadata: map[string]string{"cn_last_checkin_msg": "已领 5 积分"},
+		Status:   "token_ok",
+	}
+	s, ts, _ := newCNTestServer(t, up.URL, acc)
+	_ = s
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/api/cn/dashboard", nil)
+	// 测试 server 的 auth middleware 会拦；直接调 handler 更简单
+	w := httptest.NewRecorder()
+	s.handleCNDashboard(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var d struct {
+		Enabled      bool `json:"enabled"`
+		Accounts     int  `json:"accounts"`
+		Callable     int  `json:"callable"`
+		CheckinToday int  `json:"checkin_today"`
+		Config       []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"config"`
+		AccountViews []struct {
+			Email      string `json:"email"`
+			CallGate   string `json:"call_gate"`
+			TokenState string `json:"token_state"`
+		} `json:"account_views"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Enabled || d.Accounts != 1 {
+		t.Fatalf("enabled=%v accounts=%d", d.Enabled, d.Accounts)
+	}
+	if d.Callable != 1 {
+		t.Fatalf("CN account with access_token must be callable, got %d", d.Callable)
+	}
+	if len(d.AccountViews) != 1 || d.AccountViews[0].CallGate != store.CallGateReady {
+		t.Fatalf("view gate=%+v", d.AccountViews)
+	}
+	if len(d.Config) < 10 {
+		t.Fatalf("config rows too few: %d", len(d.Config))
+	}
+	found := false
+	for _, c := range d.Config {
+		if c.Key == "CN_ENABLED" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("config snapshot missing CN_ENABLED")
+	}
+}
+
+// 手动摘重登标记。
+func TestCNReloginClear(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := store.Open(dir)
+	authMgr, _ := auth.New("admin", "pass")
+	s := New(config.Config{CNEnabled: true, DataDir: dir}, db, authMgr, nil)
+	db.Upsert(&store.Account{ID: "cn-7", Channel: store.ChannelCN, Email: "x@cn",
+		AccessToken: "t", Metadata: map[string]string{"cn_needs_relogin": "true"}, LastError: "dead"})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/cn/accounts/cn-7/relogin-clear", nil)
+	req.SetPathValue("id", "cn-7")
+	w := httptest.NewRecorder()
+	s.handleCNReloginClear(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+	acc, _ := db.SnapshotAccount("cn-7")
+	if acc.Metadata["cn_needs_relogin"] != "" || acc.LastError != "" {
+		t.Fatalf("flag not cleared: %+v", acc.Metadata)
+	}
+}

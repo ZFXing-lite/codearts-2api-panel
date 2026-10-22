@@ -299,6 +299,21 @@ tr.health-circuit td.col-gate { box-shadow: inset 3px 0 0 var(--red); }
   grid-template-columns: repeat(4, 1fr);
   gap: 12px;
 }
+/* CN 模型目录 pill（国内码道页） */
+.usage-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin: 0 8px 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+}
+.usage-pill b { font-weight: 600; color: var(--accent); }
+/* CN 运行参数表：变量名列等宽 */
+.tbl.cn-cfg td:first-child { font-family: ui-monospace, monospace; }
 @media (max-width: 1000px) {
   .usage-strip { grid-template-columns: repeat(2, 1fr); }
 }

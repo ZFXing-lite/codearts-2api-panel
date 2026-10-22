@@ -346,6 +346,14 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("PUT /api/proxies/strategy", s.handleProxyStrategy)
 	mux.HandleFunc("PUT /api/accounts/{id}/proxy", s.handleSetAccountProxy)
 
+	// 国内码道（CN 渠道）面板 API — 见 cnpanel.go
+	mux.HandleFunc("GET /api/cn/dashboard", s.handleCNDashboard)
+	mux.HandleFunc("POST /api/cn/import", s.handleCNImport)
+	mux.HandleFunc("POST /api/cn/accounts/{id}/refresh", s.handleCNRefresh)
+	mux.HandleFunc("POST /api/cn/accounts/{id}/checkin", s.handleCNCheckin)
+	mux.HandleFunc("POST /api/cn/accounts/{id}/relogin-clear", s.handleCNReloginClear)
+	mux.HandleFunc("GET /api/cn/models", s.handleCNModels)
+
 	mux.HandleFunc("GET /api/apikeys", s.handleListAPIKeys)
 	mux.HandleFunc("POST /api/apikeys", s.handleCreateAPIKey)
 	mux.HandleFunc("POST /api/apikeys/batch", s.handleBatchAPIKeys)
@@ -2031,11 +2039,30 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		circuitSnap = s.circuit.Snapshot()
 	}
 	accountViews := make([]map[string]any, 0, len(accounts))
+	// 双渠道分解：总览页要能一眼区分国际版 / 国内码道各自的池况。
+	type chanStat struct {
+		Accounts int `json:"accounts"`
+		Callable int `json:"callable"`
+		Disabled int `json:"disabled"`
+	}
+	chanStats := map[string]*chanStat{"intl": {}, "cn": {}}
+	statFor := func(a *store.Account) *chanStat {
+		if store.NormalizeChannel(a.Channel) == store.ChannelCN {
+			return chanStats["cn"]
+		}
+		return chanStats["intl"]
+	}
 	for _, a := range accounts {
 		a.RecomputeCallGate(now)
 		gateCounts[a.CallGate]++
-		if a.CallGate == store.CallGateReady || a.CallGate == store.CallGateQuotaExhausted {
+		cs := statFor(a)
+		cs.Accounts++
+		if (a.CallGate == store.CallGateReady || a.CallGate == store.CallGateQuotaExhausted) && !a.Disabled {
+			cs.Callable++
 			callable++
+		}
+		if a.Disabled {
+			cs.Disabled++
 		}
 		if a.CallGate == store.CallGateQuotaExhausted {
 			exhausted++
@@ -2072,6 +2099,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		accountViews = append(accountViews, map[string]any{
 			"id":                a.ID,
+			"channel":           store.NormalizeChannel(a.Channel),
+			"user_id":           a.UserID,
 			"email":             a.Email,
 			"status":            a.Status,
 			"call_gate":         a.CallGate,
@@ -2155,6 +2184,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"package_tokens":  totalPackage,
 		"period_counts":   periodCounts,
 		"gate_counts":     gateCounts,
+		"channel_stats":   chanStats,
 		"next_expire":     nextExpire,
 		"account_views":   accountViews,
 		"cache":           cacheSnap,
@@ -2630,6 +2660,17 @@ func (s *Server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.Method == http.MethodPost || r.URL.Query().Get("refresh") == "1"
+	// 国内码道账号无国际 quota；返回 token 视图，避免面板"刷新额度"报错。
+	if store.NormalizeChannel(a.Channel) == store.ChannelCN {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"account_id":    a.ID,
+			"email":         a.Email,
+			"channel":       "cn",
+			"token_expires": a.TokenExpires,
+			"message":       "国内码道渠道不适用国际额度查询（额度走每日签到/积分）",
+		})
+		return
+	}
 	if !force && a.Quota != nil && a.Quota.Error == "" && time.Since(a.Quota.FetchedAt) < 5*time.Minute {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"account_id": a.ID,

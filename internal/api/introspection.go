@@ -106,9 +106,28 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"chat_sem_cap":      cap(s.chatSem),
 		"callable_accounts": callable,
 	}
+	// 国内码道渠道参数：面板/运维在 API 层也能核对 CN 配置，
+	// 不必翻 .env 或日志。
+	cn := map[string]any{
+		"enabled":            cfg.CNEnabled,
+		"auth_dir":           cfg.CNAuthDir,
+		"default_model":      cfg.CNDefaultModel,
+		"watch_poll":         cfg.CNWatchPoll.String(),
+		"refresh_skew":       cfg.CNRefreshSkew.String(),
+		"keepalive_window":   cfg.CNKeepaliveWindow.String(),
+		"keepalive_interval": cfg.CNKeepaliveInterval.String(),
+		"max_concurrent":     cfg.CNMaxConcurrent,
+		"upstream_timeout":   cfg.CNUpstreamTimeout.String(),
+		"err_threshold":      cfg.CNErrThreshold,
+		"err_cooldown":       cfg.CNErrCooldown.String(),
+		"soft_cooldown":      cfg.CNSoftCooldown.String(),
+		"credits_auto_claim": cfg.CNCreditsAutoClaim,
+		"benefit_auto_claim": cfg.CNBenefitAutoClaim,
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"runtime":        runtime,
 		"hot_reloadable": hot,
+		"cn_channel":     cn,
 		"build_info":     build,
 	})
 }
