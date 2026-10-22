@@ -181,9 +181,11 @@ func (s *Server) cnUpstream() *cnup.Client {
 // cnAcquire takes a per-account slot honoring cfg.CNMaxConcurrent.
 // Returns nil when the account is at capacity.
 func (s *Server) cnAcquire(accountID string) func() {
+	// 默认对齐上游硬限：华为 CodeArts 单账号并发会话上限是 3，
+	// 之前默认 5 会常态化撞 TM.00001041（会话数超限），白白消耗重试预算。
 	max := s.cfg.CNMaxConcurrent
 	if max <= 0 {
-		max = 5
+		max = 3
 	}
 	s.cnSemaMu.Lock()
 	if s.cnSema == nil {

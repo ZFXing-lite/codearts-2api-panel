@@ -120,14 +120,27 @@ func (w *Watcher) Run(ctx context.Context) {
 
 // scanOnce 对全部 Channel=="cn" 账号串行执行一轮 watch。
 func (w *Watcher) scanOnce(ctx context.Context) {
+	live := map[string]bool{}
 	for _, a := range w.db.List() {
 		if a == nil || store.NormalizeChannel(a.Channel) != store.ChannelCN {
 			continue
+		}
+		if a.UserID != "" {
+			live[a.UserID] = true
 		}
 		if ctx.Err() != nil {
 			return
 		}
 		w.watchAccount(ctx, a.ID)
+	}
+	// 删号/换号后，旧账号的模型目录会一直驻留（known 索引只增不减）。
+	if n := cnup.PruneCatalogs(live); n > 0 {
+		log.Printf("cnwatch: pruned %d stale model catalogs", n)
+	}
+	if real, ok := w.client.(*cnup.Client); ok {
+		if n := real.PruneSrcFail(live); n > 0 {
+			log.Printf("cnwatch: pruned %d stale source-failure entries", n)
+		}
 	}
 }
 

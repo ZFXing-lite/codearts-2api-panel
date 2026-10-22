@@ -117,6 +117,11 @@ type Server struct {
 	cnSema   map[string]chan struct{} // accountID -> per-account in-flight slots
 	cnLogins *cnLoginStore            // 面板内置 OAuth 登录会话（cnlogin.go）
 
+	// 批量刷额度是异步任务：300+ 账号 × 单账号最长几十秒，串行跑不可能
+	// 在浏览器/反代的请求超时内完成，超时后 ctx 取消，池子停在刷了一半。
+	quotaTaskMu sync.Mutex
+	quotaTask   *quotaRefreshTask
+
 	// Cached chat HTTP clients per (direct/proxy) key — avoids per-request
 	// transport clone that defeated connection pooling (BUG-7 fix).
 	chatClients *chatClientCache
@@ -333,7 +338,12 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("PATCH /api/accounts/{id}/priority", s.handlePatchAccountPriority)
 	mux.HandleFunc("PUT /api/accounts/{id}/enable", s.handleEnableAccount)
 	mux.HandleFunc("POST /api/accounts/quota/refresh-all", s.handleRefreshAllQuotas)
-	mux.HandleFunc("GET /api/oauth/start", s.handleOAuthStart)
+	mux.HandleFunc("GET /api/accounts/quota/refresh-all/status", s.handleRefreshAllQuotasStatus)
+	// 发起授权带副作用（清空该账号凭据、在宿主机拉起浏览器、开本地待授权端口），
+	// 所以主入口是 POST——GET 会被 <img src>、预取、反代日志重放这类东西触发。
+	// GET 仍保留，但只返回说明，不执行任何动作。
+	mux.HandleFunc("POST /api/oauth/start", s.handleOAuthStart)
+	mux.HandleFunc("GET /api/oauth/start", s.handleOAuthStartReadonly)
 	mux.HandleFunc("GET /api/oauth/status", s.handleOAuthStatus)
 	// 该路径被国际版 OAuth 与国内码道共用：国内有活跃会话时按 CN 处理，
 	// 否则回退国际版提示页（见 cnlogin.go）。
@@ -515,7 +525,7 @@ func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
 				writeErr(w, http.StatusUnauthorized, "invalid or missing API key")
 				return
 			}
-			if !s.acquireKeyGate(w, gateID) {
+			if !s.acquireKeyGate(w, r, gateID) {
 				return
 			}
 			defer s.releaseKeyGate(gateID)
@@ -532,14 +542,14 @@ func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) acquireKeyGate(w http.ResponseWriter, id string) bool {
+func (s *Server) acquireKeyGate(w http.ResponseWriter, r *http.Request, id string) bool {
 	if s == nil || s.keyGate == nil || id == "" {
 		return true
 	}
 	if s.keyGate.Acquire(id, s.keyInFlightShare()) {
 		return true
 	}
-	writeErr(w, http.StatusTooManyRequests, "key concurrency or RPM limit reached")
+	writeChatErr(w, r, http.StatusTooManyRequests, "rate_limit_exceeded", "key concurrency or RPM limit reached")
 	return false
 }
 
@@ -846,12 +856,12 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-s.chatSem }()
 	case <-semWait.C:
 		// Waited 500ms, still full — reject.
-		writeErr(w, http.StatusServiceUnavailable, "gateway at capacity, please retry shortly")
+		writeChatErr(w, r, http.StatusServiceUnavailable, "overloaded", "gateway at capacity, please retry shortly")
 		return
 	case <-r.Context().Done():
 		semWait.Stop()
 		// Client disconnected while waiting.
-		writeErr(w, http.StatusServiceUnavailable, "client disconnected")
+		writeChatErr(w, r, http.StatusServiceUnavailable, "client_disconnected", "client disconnected")
 		return
 	}
 
@@ -873,17 +883,23 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 	// intl alias rewrite never mangles CN-canonical model names
 	// (e.g. snap-chat must NOT become GLM-5.2 on the CN channel).
 	cnRealm, cnBareModel := cnSplitChannelModel(peekModel(body))
+	var droppedFields []string
 	if cnRealm != "" {
 		if body = rewriteBodyModel(body, cnBareModel); cnRealm == store.ChannelCN {
-			body = sanitizeCLIChatBodyOpt(body, true)
+			body, droppedFields = sanitizeCLIChatBodyWithDropped(body, true)
 		} else {
-			body = sanitizeCLIChatBody(body)
+			body, droppedFields = sanitizeCLIChatBodyWithDropped(body, false)
 		}
 	} else {
-		body = sanitizeCLIChatBody(body)
+		body, droppedFields = sanitizeCLIChatBodyWithDropped(body, false)
+	}
+	// 静默丢字段会让客户端以为 JSON mode / seed 生效了。把丢弃清单回显出去，
+	// 让"没生效"这件事在客户端可见。
+	if len(droppedFields) > 0 {
+		w.Header().Set("X-Dropped-Fields", strings.Join(droppedFields, ","))
 	}
 	if cnRealm == store.ChannelCN && !s.cfg.CNEnabled {
-		writeErr(w, http.StatusServiceUnavailable, "cn channel disabled (CN_ENABLED=false)")
+		writeChatErr(w, r, http.StatusServiceUnavailable, "channel_disabled", "cn channel disabled (CN_ENABLED=false)")
 		return
 	}
 	body = s.restoreThink(body)
@@ -958,10 +974,10 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 	if len(valid) == 0 {
 		recordStats(wantStream, false, 0, 0, 0)
 		if reqKey != nil && len(reqKey.AccountIDs) > 0 {
-			writeErr(w, http.StatusServiceUnavailable, "no callable account in this key's allowlist")
+			writeChatErr(w, r, http.StatusServiceUnavailable, "no_callable_account", "no callable account in this key's allowlist")
 			return
 		}
-		writeErr(w, http.StatusServiceUnavailable, "no callable account (all exhausted or disabled)")
+		writeChatErr(w, r, http.StatusServiceUnavailable, "no_callable_account", "no callable account (all exhausted or disabled)")
 		return
 	}
 
@@ -1020,7 +1036,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 			if sseCommitted {
 				writeSSEStopDone(w, pin)
 			} else {
-				writeErr(w, http.StatusGatewayTimeout, "streaming request exceeded wall-clock limit")
+				writeChatErr(w, r, http.StatusGatewayTimeout, "timeout", "streaming request exceeded wall-clock limit")
 			}
 			return
 		}
@@ -1239,7 +1255,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 						log.Printf("chat stream_close_done rid=%s reason=%s", rid, msg)
 						writeSSEStopDone(w, pin)
 					} else {
-						writeUpstreamClientErr(w, resp.StatusCode, respBody)
+						writeUpstreamClientErr(w, r, resp.StatusCode, respBody)
 					}
 				}
 				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests ||
@@ -1439,7 +1455,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 					recordStats(wantStream, false, 0, 0, 0)
 					endLease(acc.ID)
 					if !wantStream && !sseCommitted {
-						writeUpstreamClientErr(w, http.StatusBadRequest, []byte(relayErr.Error()))
+						writeUpstreamClientErr(w, r, http.StatusBadRequest, []byte(relayErr.Error()))
 					}
 					return
 				}
@@ -1690,7 +1706,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			recordStats(false, false, 0, 0, 0)
 			endLease(acc.ID)
-			writeUpstreamClientErr(w, resp.StatusCode, respBody)
+			writeUpstreamClientErr(w, r, resp.StatusCode, respBody)
 			return
 		}
 		if _, _, ok := parseHuaweiModelErr(respBody); ok {
@@ -1698,7 +1714,7 @@ func (s *Server) handleHuaweiChat(w http.ResponseWriter, r *http.Request) {
 			s.recordAccountRotate(acc, truncateStr(string(respBody), 160))
 			recordStats(false, false, 0, 0, 0)
 			endLease(acc.ID)
-			writeUpstreamClientErr(w, http.StatusBadRequest, respBody)
+			writeUpstreamClientErr(w, r, http.StatusBadRequest, respBody)
 			return
 		}
 
@@ -1861,11 +1877,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // writeUpstreamClientErr rewrites Huawei InferHub/TM error payloads into OpenAI-compatible
 // {"error":{"message":"...","type":"invalid_request_error","code":"..."}} so clients like
 // OpenCode can parse them instead of failing schema validation.
-func writeUpstreamClientErr(w http.ResponseWriter, status int, body []byte) {
+func writeUpstreamClientErr(w http.ResponseWriter, r *http.Request, status int, body []byte) {
 	log.Printf("client_upstream_err status=%d body=%q", status, truncateStr(string(body), 240))
 	// Session-cap must never reach the client as 400 / TM.* text.
 	if looksLikeSessionCap(status, body) {
-		writeErr(w, http.StatusServiceUnavailable, "upstream temporarily unavailable, please retry")
+		writeChatErr(w, r, http.StatusServiceUnavailable, "upstream_unavailable", "upstream temporarily unavailable, please retry")
 		return
 	}
 	msg := strings.TrimSpace(string(body))
@@ -1900,6 +1916,29 @@ func writeUpstreamClientErr(w http.ResponseWriter, status int, body []byte) {
 			"type":    "invalid_request_error",
 			"code":    code,
 		},
+	})
+}
+
+// writeChatErr 按客户端协议输出错误体。
+//
+// writeErr 的 {"error":"字符串"} 三种 SDK 都认不出：Anthropic 要
+// {"type":"error","error":{"type":…}}，OpenAI 要 {"error":{"message","type","code"}}。
+// 形状不对时 SDK 抛的是"未知错误"，按 code 判定的自动重试策略全部失效。
+// 面向 /v1 的错误走这里，管理面板接口仍用 writeErr。
+func writeChatErr(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout {
+		w.Header().Set("Retry-After", "5")
+	}
+	if detectClientProto(r) == protoClaude {
+		writeJSON(w, status, map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": code, "message": msg},
+		})
+		return
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{"message": msg, "type": code, "code": code},
 	})
 }
 
@@ -1992,6 +2031,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// 光清 cookie 不算登出：token 在 TTL 内仍然有效，拿到副本的人照样能进。
+	// 这里把当前会话加入撤销表，让它在服务端立即失效。
+	for _, c := range r.Cookies() {
+		if c.Name == "admin_session" {
+			s.auth.Revoke(c.Value)
+		}
+	}
+	if tok := strings.TrimSpace(r.Header.Get("X-Admin-Token")); tok != "" {
+		s.auth.Revoke(tok)
+	}
 	s.clearAdminCookies(w)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "logout"})
 }
@@ -3081,6 +3130,14 @@ func stringMap(m map[string]any, key string) string {
 }
 
 // ---------- oauth ----------
+
+// handleOAuthStartReadonly 说明为什么 GET 不再发起授权。
+func (s *Server) handleOAuthStartReadonly(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+		"error": "use POST /api/oauth/start",
+		"why":   "starting an authorization clears the account credentials and opens a local callback port; it must not be reachable by a plain GET",
+	})
+}
 
 func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	accountID := r.URL.Query().Get("account_id")

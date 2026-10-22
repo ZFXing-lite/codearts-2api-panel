@@ -185,6 +185,35 @@ func AccountModels(accountID string) ([]ModelInfo, bool) {
 }
 
 // AccountCatalogStale 报告某账号目录是否需重新发现（未发现或超过 CatalogTTL）。
+// PruneCatalogs 丢掉已不存在的账号的模型目录。
+// known 索引只增不减，删号/换号后旧账号的 ModelInfo 会一直驻留，
+// 长期运行的网关内存缓慢上涨。cnwatch 每轮用当前账号集合调用一次。
+func PruneCatalogs(keep map[string]bool) int {
+	catalog.Lock()
+	defer catalog.Unlock()
+	removed := 0
+	for id := range catalog.accounts {
+		if keep[id] {
+			continue
+		}
+		delete(catalog.accounts, id)
+		removed++
+	}
+	if removed > 0 {
+		// known 是从各账号目录汇总出来的反查表，账号删掉后重建即可。
+		catalog.known = map[string]string{}
+		for _, ac := range catalog.accounts {
+			for _, m := range ac.infos {
+				key := strings.ToLower(m.ID)
+				if _, ok := catalog.known[key]; !ok {
+					catalog.known[key] = m.ID
+				}
+			}
+		}
+	}
+	return removed
+}
+
 func AccountCatalogStale(accountID string) bool {
 	catalog.RLock()
 	defer catalog.RUnlock()

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go-codearts/internal/huawei"
@@ -543,45 +544,127 @@ func (s *Server) handleEnableAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, redactAccount(a))
 }
 
+// quotaRefreshTask 是一次批量刷额度的进度。
+type quotaRefreshTask struct {
+	ID        string    `json:"task_id"`
+	Total     int       `json:"total"`
+	Done      int       `json:"done"`
+	OK        int       `json:"ok"`
+	Fail      int       `json:"fail"`
+	Skipped   int       `json:"skipped"`
+	Running   bool      `json:"running"`
+	Started   time.Time `json:"started"`
+	Finished  time.Time `json:"finished,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+}
+
+// handleRefreshAllQuotas 起一个后台任务并立刻返回。
+// 之前的实现是同步串行循环：358 个账号根本跑不完，
+// 请求超时后 ctx 取消，池子停在中间态，而响应体还没开始写。
 func (s *Server) handleRefreshAllQuotas(w http.ResponseWriter, r *http.Request) {
 	list := s.db.List()
-	type item struct {
-		ID    string `json:"id"`
-		Email string `json:"email"`
-		OK    bool   `json:"ok"`
-		Gate  string `json:"call_gate"`
-		Error string `json:"error,omitempty"`
+	s.quotaTaskMu.Lock()
+	if s.quotaTask != nil && s.quotaTask.Running {
+		task := *s.quotaTask
+		s.quotaTaskMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"task": task, "note": "already running"})
+		return
 	}
-	out := make([]item, 0, len(list))
+	task := &quotaRefreshTask{
+		ID:      randID("quota"),
+		Total:   len(list),
+		Running: true,
+		Started: time.Now(),
+	}
+	s.quotaTask = task
+	// 必须在锁内拷值：锁外解引用 *task 时，后台 worker 已经在改同一份结构体。
+	snapshot := *task
+	s.quotaTaskMu.Unlock()
+
+	go s.runQuotaRefresh(snapshot.ID, list)
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"task": snapshot})
+}
+
+// handleRefreshAllQuotasStatus 供面板轮询进度。
+func (s *Server) handleRefreshAllQuotasStatus(w http.ResponseWriter, r *http.Request) {
+	s.quotaTaskMu.Lock()
+	task := s.quotaTask
+	var snapshot quotaRefreshTask
+	if task != nil {
+		snapshot = *task
+	}
+	s.quotaTaskMu.Unlock()
+	if task == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"task": nil})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task": snapshot})
+}
+
+// runQuotaRefresh 用有限并发跑批量刷新。ctx 与请求解耦：客户端关页面
+// 不该让任务半途而废。
+func (s *Server) runQuotaRefresh(taskID string, list []*store.Account) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	const workers = 8
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
 	for _, a := range list {
-		it := item{ID: a.ID, Email: a.Email}
-		// CN 渠道没有国际 quota 体系（额度概念走积分/签到），
-		// 打国际 insight 接口只会失败并污染 LastError。
 		if store.NormalizeChannel(a.Channel) == store.ChannelCN {
-			a.RecomputeCallGate(time.Now())
-			it.Gate = a.CallGate
-			it.Error = "cn channel — 额度走签到/积分，不适用国际额度刷新"
-			out = append(out, it)
+			s.quotaTaskAdd(taskID, "skipped", "")
 			continue
 		}
 		if a.Credentials == nil || !a.Credentials.Usable() {
-			a.RecomputeCallGate(time.Now())
-			it.Gate = a.CallGate
-			it.Error = "no usable credentials"
-			out = append(out, it)
+			s.quotaTaskAdd(taskID, "fail", "no usable credentials")
 			continue
 		}
-		if _, err := s.refreshAccountQuota(r.Context(), a); err != nil {
-			it.Error = err.Error()
-			it.Gate = a.CallGate
-			out = append(out, it)
-			continue
-		}
-		it.OK = true
-		it.Gate = a.CallGate
-		out = append(out, it)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(acc *store.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				s.quotaTaskAdd(taskID, "fail", "task canceled")
+				return
+			}
+			if _, err := s.refreshAccountQuota(ctx, acc); err != nil {
+				s.quotaTaskAdd(taskID, "fail", err.Error())
+				return
+			}
+			s.quotaTaskAdd(taskID, "ok", "")
+		}(a)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": out, "total": len(out)})
+	wg.Wait()
+
+	s.quotaTaskMu.Lock()
+	if s.quotaTask != nil && s.quotaTask.ID == taskID {
+		s.quotaTask.Running = false
+		s.quotaTask.Finished = time.Now()
+	}
+	s.quotaTaskMu.Unlock()
+}
+
+func (s *Server) quotaTaskAdd(taskID, kind, errMsg string) {
+	s.quotaTaskMu.Lock()
+	defer s.quotaTaskMu.Unlock()
+	t := s.quotaTask
+	if t == nil || t.ID != taskID {
+		return
+	}
+	t.Done++
+	switch kind {
+	case "ok":
+		t.OK++
+	case "skipped":
+		t.Skipped++
+	default:
+		t.Fail++
+		if errMsg != "" {
+			t.LastError = errMsg
+		}
+	}
 }
 
 // sessionSoftCapDefault: Huawei TM.00001041 hard-limit is 3 including

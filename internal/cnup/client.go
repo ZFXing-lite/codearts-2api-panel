@@ -183,6 +183,23 @@ func (c *Client) snapURL(path string) string { return c.snapBase + path }
 // benefitURL 拼接福利网关主机地址。
 func (c *Client) benefitURL(path string) string { return c.benefitBase + path }
 
+// PruneSrcFail 丢弃已不存在账号的失败退避记录。
+// key 形如 "<accountID>|builtin"，删号后条目会永久残留。
+func (c *Client) PruneSrcFail(keep map[string]bool) int {
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	removed := 0
+	for key := range c.srcFail {
+		id, _, ok := strings.Cut(key, "|")
+		if !ok || keep[id] {
+			continue
+		}
+		delete(c.srcFail, key)
+		removed++
+	}
+	return removed
+}
+
 // srcBlocked 报告某来源是否处于失败退避窗口内。
 func (c *Client) srcBlocked(key string) bool {
 	c.srcMu.Lock()

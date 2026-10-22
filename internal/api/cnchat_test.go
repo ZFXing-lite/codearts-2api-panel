@@ -471,3 +471,65 @@ func TestCNChatStreamsClaudeProtocol(t *testing.T) {
 		t.Fatalf("missing message_stop: %s", text)
 	}
 }
+
+// 异步批量刷额度：接口立刻返回任务，进度靠单独接口轮询。
+// 同步串行版本在几百账号时必然超过请求超时，池子停在半途。
+func TestRefreshAllQuotasIsAsync(t *testing.T) {
+	up := fakeCNUpstream(t)
+	defer up.Close()
+	srv, ts, _ := newCNTestServer(t, up.URL, cnTestAccount("cn-1"))
+
+	adminTok, err := srv.auth.Login("pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/quota/refresh-all", strings.NewReader("{}"))
+	req.Header.Set("X-Admin-Token", adminTok)
+	req.Header.Set("X-CSRF-Token", srv.auth.CSRFToken(adminTok))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 async task, got %d", resp.StatusCode)
+	}
+	var out struct {
+		Task struct {
+			ID      string `json:"task_id"`
+			Total   int    `json:"total"`
+			Running bool   `json:"running"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Task.ID == "" || out.Task.Total == 0 {
+		t.Fatalf("bad task payload: %+v", out.Task)
+	}
+
+	// CN 账号没有国际额度体系，应当被计入 skipped 而不是失败。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		sreq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/accounts/quota/refresh-all/status", nil)
+		sreq.Header.Set("X-Admin-Token", adminTok)
+		st, _ := http.DefaultClient.Do(sreq)
+		var s struct {
+			Task *struct {
+				Done    int  `json:"done"`
+				Skipped int  `json:"skipped"`
+				Running bool `json:"running"`
+			} `json:"task"`
+		}
+		_ = json.NewDecoder(st.Body).Decode(&s)
+		st.Body.Close()
+		if s.Task != nil && !s.Task.Running {
+			if s.Task.Skipped != 1 {
+				t.Fatalf("expected 1 skipped (cn channel), got %+v", *s.Task)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("task did not finish in time")
+}

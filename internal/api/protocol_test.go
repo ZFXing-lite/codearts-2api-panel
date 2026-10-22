@@ -541,3 +541,25 @@ func TestConsumeSSEArrayContentIsComplete(t *testing.T) {
 		t.Fatal("array content must count as answer")
 	}
 }
+
+// 非流式 Claude thinking 块必须带 signature：Anthropic 的 ThinkingBlock
+// 校验该字段，缺了客户端会把整条 assistant 历史丢掉。
+func TestNonStreamClaudeThinkingHasSignature(t *testing.T) {
+	body := []byte(`{"id":"c1","model":"GLM-5.2","choices":[{"message":{"reasoning_content":"先算 1+1","content":"等于 2"},"finish_reason":"stop"}]}`)
+	out := openaiCompletionToClaude(body, &ssePin{Proto: protoClaude, Model: "GLM-5.2"})
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("bad json: %s", out)
+	}
+	blocks, _ := got["content"].([]any)
+	if len(blocks) == 0 {
+		t.Fatalf("no content blocks: %s", out)
+	}
+	think, _ := blocks[0].(map[string]any)
+	if think["type"] != "thinking" {
+		t.Fatalf("first block should be thinking: %+v", think)
+	}
+	if sig, _ := think["signature"].(string); sig == "" {
+		t.Fatalf("thinking block missing signature: %+v", think)
+	}
+}

@@ -133,7 +133,7 @@ func Get() Config {
 		CNErrCooldown:       envDuration("CN_ERR_COOLDOWN", 10*time.Minute),
 		CNBenefitAutoClaim:  envBool("CN_BENEFIT_AUTO_CLAIM", true),
 		CNCreditsAutoClaim:  envBool("CN_CREDITS_AUTO_CLAIM", true),
-		CNMaxConcurrent:     envInt("CN_MAX_CONCURRENT", 5),
+		CNMaxConcurrent:     envInt("CN_MAX_CONCURRENT", 3),
 		CNKeepaliveWindow:   envDuration("CN_KEEPALIVE_WINDOW", 10*time.Minute),
 		CNKeepaliveInterval: envDuration("CN_KEEPALIVE_INTERVAL", 15*time.Minute),
 		CNWatchPoll:         envDuration("CN_WATCH_POLL", 30*time.Minute),

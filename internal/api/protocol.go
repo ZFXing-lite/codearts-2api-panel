@@ -1317,7 +1317,14 @@ func openaiCompletionToClaude(body []byte, pin *ssePin) []byte {
 	}
 	content := []any{}
 	if msg.Reasoning != "" {
-		content = append(content, map[string]any{"type": "thinking", "thinking": msg.Reasoning})
+		// 必须带 signature：Anthropic 的 ThinkingBlock 校验该字段，缺了
+		// 客户端会把这条 assistant 消息从历史里丢掉，或 SDK 反序列化直接报错。
+		// 与流式共用同一份确定性签名，保证重放时字节一致（prompt cache 稳定）。
+		content = append(content, map[string]any{
+			"type":      "thinking",
+			"thinking":  msg.Reasoning,
+			"signature": computeThinkSignature(msg.Reasoning),
+		})
 	}
 	if msg.Content != "" {
 		content = append(content, map[string]any{"type": "text", "text": msg.Content})

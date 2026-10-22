@@ -3,6 +3,7 @@ package proxypool
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,11 +26,15 @@ type fileData struct {
 
 // Store is a file-backed proxy registry (independent of accounts.json).
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	proxies  map[string]Proxy
-	strategy Strategy
-	rrCursor int
+	// probeSaveAt 节流探活状态的落盘：探活每几十秒一轮，每次都全量重写
+	// 文件既浪费又容易被上游抖动放大成写风暴。丢几秒探活状态无害（下轮重算），
+	// 但代理的增删改仍然立即落盘。
+	probeSaveAt time.Time
+	mu          sync.Mutex
+	path        string
+	proxies     map[string]Proxy
+	strategy    Strategy
+	rrCursor    int
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -56,6 +61,19 @@ func Open(dataDir string) (*Store, error) {
 		}
 	}
 	return s, nil
+}
+
+// saveProbeLocked 节流落盘探活结果，并且不再吞掉写盘错误。
+// 原先是 `_ = s.saveLocked()`：磁盘满 / 权限错时完全无声，运维以为代理池在持久化。
+func (s *Store) saveProbeLocked() {
+	now := time.Now()
+	if now.Sub(s.probeSaveAt) < 5*time.Second {
+		return
+	}
+	s.probeSaveAt = now
+	if err := s.saveLocked(); err != nil {
+		log.Printf("proxypool: persist probe status failed: %v", err)
+	}
 }
 
 func (s *Store) saveLocked() error {
@@ -211,7 +229,7 @@ func (s *Store) MarkSuccess(id string) {
 	p.CooldownUntil = time.Time{}
 	p.UpdatedAt = p.LastCheckAt
 	s.proxies[p.ID] = p
-	_ = s.saveLocked()
+	s.saveProbeLocked()
 }
 
 func (s *Store) MarkFailure(id, errMsg string, cooldown time.Duration) {
@@ -230,7 +248,7 @@ func (s *Store) MarkFailure(id, errMsg string, cooldown time.Duration) {
 	}
 	p.UpdatedAt = now
 	s.proxies[p.ID] = p
-	_ = s.saveLocked()
+	s.saveProbeLocked()
 }
 
 func (s *Store) usableLocked(now time.Time) []Proxy {

@@ -383,3 +383,22 @@ func TestSanitizeScrubsPlaceholderThink(t *testing.T) {
 		t.Fatalf("placeholder must be scrubbed: %s", out)
 	}
 }
+
+// 被白名单丢掉的字段必须让客户端看得见：静默丢弃会让客户端
+// 以为 JSON mode / seed 生效了，实际拿到自由文本。
+func TestDroppedFieldsReported(t *testing.T) {
+	in := []byte(`{"model":"GLM-5.2","messages":[{"role":"user","content":"hi"}],"verbosity":"low","response_format":{"type":"json_object"}}`)
+	out, dropped := sanitizeCLIChatBodyWithDropped(in, false)
+	if strings.Contains(string(out), "response_format") {
+		t.Fatalf("response_format should be dropped: %s", out)
+	}
+	found := false
+	for _, k := range dropped {
+		if k == "response_format" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dropped list must name response_format: %v", dropped)
+	}
+}

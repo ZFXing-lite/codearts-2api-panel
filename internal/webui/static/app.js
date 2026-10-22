@@ -1000,15 +1000,43 @@ async function enableAccount(id) {
   }
 }
 
-async function refreshAllQuotas() {
+async function refreshAllQuotas(btn) {
+  // 后端改成异步任务：几百个账号串行刷根本跑不完一个请求周期。
+  // 这里发起后轮询进度，并按剩余量给出可读的进度提示。
+  if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = "刷新中…"; }
   try {
-    toast("正在批量刷新额度…");
-    const d = await api("/api/accounts/quota/refresh-all", { method: "POST", body: "{}" });
-    const ok = (d.items || []).filter((x) => x.ok).length;
-    toast(`额度刷新完成 ${ok}/${d.total || 0}`);
+    const start = await api("/api/accounts/quota/refresh-all", { method: "POST", body: "{}" });
+    const taskId = start?.task?.task_id;
+    const total = start?.task?.total || 0;
+    if (!taskId) {
+      toast("任务未启动");
+      return;
+    }
+    toast(`已开始刷新 ${total} 个账号…`);
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      let st;
+      try {
+        st = await api("/api/accounts/quota/refresh-all/status");
+      } catch (e) {
+        // 轮询失败要明说，不能静默停在一个"看起来还在跑"的状态。
+        toast("进度查询失败：" + e.message);
+        break;
+      }
+      const t = st?.task;
+      if (!t) { break; }
+      if (t.running) {
+        toast(`刷新中 ${t.done}/${t.total}（失败 ${t.fail}）`);
+        continue;
+      }
+      toast(`额度刷新完成 成功 ${t.ok} 失败 ${t.fail} 跳过 ${t.skipped}`);
+      break;
+    }
     refreshAll();
   } catch (e) {
     toast(e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || "刷新额度"; }
   }
 }
 
@@ -1141,7 +1169,9 @@ async function deleteAccount(id) {
 async function startOAuth(accountId) {
   try {
     const q = accountId ? `?account_id=${encodeURIComponent(accountId)}` : "";
-    const d = await api("/api/oauth/start" + q);
+    // POST：发起授权有副作用（清该账号凭据、拉起浏览器、开本地回调口），
+    // 不能是 GET——那种接口会被 <img src>、预取、反代重放顺手触发。
+    const d = await api("/api/oauth/start" + q, { method: "POST", body: "{}" });
     $("oauth-output").textContent = JSON.stringify(d, null, 2);
     const line = d.login_line || `${d.login_email || ""}----`;
     const lineEl = $("oauth-login-line");
@@ -1343,7 +1373,7 @@ $("acct-search")?.addEventListener("input", (e) => {
   renderAccounts();
 });
 
-$("refresh-all-quota")?.addEventListener("click", () => refreshAllQuotas());
+$("refresh-all-quota")?.addEventListener("click", (ev) => refreshAllQuotas(ev.currentTarget));
 
 function proxyForm() {
   return {

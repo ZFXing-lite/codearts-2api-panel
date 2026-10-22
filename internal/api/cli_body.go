@@ -136,16 +136,25 @@ func isHuaweiModel(model string) bool {
 // sanitizeCLIChatBody rewrites any inbound chat body to the official CLI shape:
 // Chat Completions with messages. Responses `input` and client extras are not forwarded.
 func sanitizeCLIChatBody(body []byte) []byte {
-	return sanitizeCLIChatBodyOpt(body, false)
+	out, _ := sanitizeCLIChatBodyWithDropped(body, false)
+	return out
 }
 
 func sanitizeCLIChatBodyOpt(body []byte, skipModelRewrite bool) []byte {
+	out, _ := sanitizeCLIChatBodyWithDropped(body, skipModelRewrite)
+	return out
+}
+
+// sanitizeCLIChatBodyWithDropped 在裁剪白名单之外，把被丢弃的字段名交回调用方。
+// 静默丢弃是这里最危险的行为：客户端以为 JSON mode / 可复现 seed 生效了，
+// 实际拿到的是自由文本。调用方应把这份列表回显到响应头，让"没生效"可见。
+func sanitizeCLIChatBodyWithDropped(body []byte, skipModelRewrite bool) ([]byte, []string) {
 	if len(body) == 0 {
-		return body
+		return body, nil
 	}
 	var root map[string]any
 	if json.Unmarshal(body, &root) != nil || root == nil {
-		return body
+		return body, nil
 	}
 	changed := false
 	if !skipModelRewrite && rewriteModel(root) {
@@ -202,11 +211,11 @@ func sanitizeCLIChatBodyOpt(body []byte, skipModelRewrite bool) []byte {
 		}
 	}
 	if !changed {
-		return body
+		return body, nil
 	}
 	out, err := json.Marshal(root)
 	if err != nil {
-		return body
+		return body, nil
 	}
 	// Only fire the log when the whitelist actually dropped something: field
 	// silence is the invisible-mutation the pure-forwarding rule protects
@@ -216,7 +225,7 @@ func sanitizeCLIChatBodyOpt(body []byte, skipModelRewrite bool) []byte {
 		sort.Strings(dropped)
 		log.Printf("chat body_drop_fields n=%d fields=%v has_messages=%v", len(dropped), dropped, root["messages"] != nil)
 	}
-	return out
+	return out, dropped
 }
 
 // normalizeGLMToolTurn repairs the official GLM tool+thinking chain.

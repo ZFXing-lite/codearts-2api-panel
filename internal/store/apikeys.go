@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,7 +54,12 @@ func OpenAPIKeys(dataDir string) (*APIKeyStore, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
 		var f apiKeyFile
-		if json.Unmarshal(data, &f) == nil && f.Keys != nil {
+		// 解析失败必须报错：当成空库继续跑的话，下一次 Create 会用空 map
+		// 覆盖 apikeys.json，所有已签发的 key 一起消失。
+		if uerr := json.Unmarshal(data, &f); uerr != nil {
+			return nil, fmt.Errorf("apikeys.json 解析失败（请检查/恢复备份）: %w", uerr)
+		}
+		if f.Keys != nil {
 			s.keys = f.Keys
 		}
 	}
