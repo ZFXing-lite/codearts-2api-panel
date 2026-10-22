@@ -122,6 +122,11 @@ type Server struct {
 	quotaTaskMu sync.Mutex
 	quotaTask   *quotaRefreshTask
 
+	// CN 模型目录冷启动兜底：缓存为空时 /v1/models 会现场拉一次，
+	// 用这两个字段节流，避免上游故障时每个请求都去捅。
+	cnCatalogMu  sync.Mutex
+	cnCatalogTry time.Time
+
 	// Cached chat HTTP clients per (direct/proxy) key — avoids per-request
 	// transport clone that defeated connection pooling (BUG-7 fix).
 	chatClients *chatClientCache
@@ -682,9 +687,17 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "deleted"})
 }
 
-func (s *Server) collectedModelIDs() []string {
+// 渠道前缀：/v1/models 的每一条都带前缀，客户端据此显式选链路。
+// 裸名仍然可用（默认双渠道 + 评分选择），但列表里不再输出裸名 ——
+// 否则同名模型无法区分国内外，客户端选中哪条是隐式的。
+const (
+	modelPrefixGlobal = "global:"
+	modelPrefixCN     = "cn:"
+)
+
+func (s *Server) collectedModelIDs(ctx context.Context) []string {
 	seen := map[string]struct{}{}
-	out := make([]string, 0, 16)
+	out := make([]string, 0, 32)
 	add := func(ids []string) {
 		for _, id := range ids {
 			id = strings.TrimSpace(id)
@@ -698,39 +711,133 @@ func (s *Server) collectedModelIDs() []string {
 			out = append(out, id)
 		}
 	}
+	withPrefix := func(prefix string, ids []string) []string {
+		res := make([]string, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			res = append(res, prefix+id)
+		}
+		return res
+	}
+
+	// ---- 国际版（global:） ----
+	var intlIDs []string
 	if s.huaweiModel != nil {
-		add(s.huaweiModel.ModelIDs())
+		intlIDs = append(intlIDs, s.huaweiModel.ModelIDs()...)
 	}
+	var cnAccounts []*store.Account
 	if s.db != nil {
 		for _, a := range s.db.List() {
-			if a != nil {
-				add(a.Models)
-			}
-		}
-	}
-	add(huawei.FallbackModelIDs)
-	// CN 渠道模型目录以 "cn:" 前缀合流（workbuddy2api 的 realm 前缀协议）：
-	// 检出目录按账号缓存（cnwatch/登录时拉取），同 ID 与国际侧不冲突——
-	// 客户端用前缀显式选渠道。
-	if s.db != nil {
-		for _, a := range s.db.List() {
-			if a == nil || store.NormalizeChannel(a.Channel) != store.ChannelCN || a.UserID == "" {
+			if a == nil {
 				continue
 			}
-			infos, ok := cnup.AccountModels(a.UserID)
-			if !ok {
+			// CN 账号的 Models 属于国内目录，不能混进 global 侧。
+			if store.IsCNAccount(a) {
+				cnAccounts = append(cnAccounts, a)
 				continue
 			}
-			ids := make([]string, 0, len(infos))
-			for _, m := range infos {
-				if m.ID != "" {
-					ids = append(ids, store.ChannelCN+":"+m.ID)
-				}
-			}
-			add(ids)
+			intlIDs = append(intlIDs, a.Models...)
 		}
 	}
+	intlIDs = append(intlIDs, huawei.FallbackModelIDs...)
+	add(withPrefix(modelPrefixGlobal, intlIDs))
+
+	// ---- 国内码道（cn:） ----
+	cnIDs := s.collectCNModelIDs(ctx, cnAccounts)
+	add(withPrefix(modelPrefixCN, cnIDs))
 	return out
+}
+
+// collectCNModelIDs 汇总国内渠道的模型 ID。
+//
+// 目录是进程内缓存（登录 / cnwatch 保活时拉取），冷启动后第一次问
+// /v1/models 时缓存还是空的，面板与下游都会看到"国内模型一个都没有"。
+// 这里做一次受限的同步兜底：只要所有 CN 账号都没有缓存，就挑一个能
+// 拉取的账号现场拉一次，超时 4 秒 —— 用一点首屏延迟换"看得见"。
+func (s *Server) collectCNModelIDs(ctx context.Context, accounts []*store.Account) []string {
+	ids := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	gather := func(uid string) bool {
+		infos, ok := cnup.AccountModels(uid)
+		if !ok {
+			return false
+		}
+		for _, m := range infos {
+			if m.ID == "" {
+				continue
+			}
+			if _, dup := seen[m.ID]; dup {
+				continue
+			}
+			seen[m.ID] = struct{}{}
+			ids = append(ids, m.ID)
+		}
+		return true
+	}
+
+	anyCached := false
+	for _, a := range accounts {
+		if a.UserID != "" && gather(a.UserID) {
+			anyCached = true
+			continue
+		}
+		// 目录没拉到，但账号本身记着模型名（导入/登录时写入）：不能因此
+		// 让面板和下游看到"国内模型一个都没有"。
+		for _, m := range a.Models {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			if _, dup := seen[m]; dup {
+				continue
+			}
+			seen[m] = struct{}{}
+			ids = append(ids, m)
+		}
+	}
+	if anyCached || s.cnUpstream() == nil {
+		return ids
+	}
+
+	// 全空 → 现场拉一次。节流 30 秒：上游故障时不能每次请求都去捅。
+	s.cnCatalogMu.Lock()
+	last := s.cnCatalogTry
+	if !last.IsZero() && time.Since(last) < 30*time.Second {
+		s.cnCatalogMu.Unlock()
+		return ids
+	}
+	s.cnCatalogTry = time.Now()
+	s.cnCatalogMu.Unlock()
+
+	for _, a := range accounts {
+		if a.UserID == "" {
+			continue
+		}
+		acct := &cnup.Account{UserID: a.UserID, CloudDragonTok: a.AccessToken}
+		if a.Credentials != nil {
+			acct.AccessKeyID = a.Credentials.AccessKeyID
+			acct.SecretAccessKey = a.Credentials.SecretAccessKey
+			if acct.CloudDragonTok == "" {
+				acct.CloudDragonTok = a.Credentials.SecurityToken
+			}
+		}
+		if acct.CloudDragonTok == "" && acct.AccessKeyID == "" {
+			continue
+		}
+		// FetchModels 自带客户端超时；这里不再叠加 context 取消，
+		// 否则中途取消会让缓存层把半截结果当成结论。
+		_, err := s.cnUpstream().FetchModels(acct)
+		if err != nil {
+			log.Printf("models: cn catalog fetch account=%s failed: %v", a.ID, err)
+			continue
+		}
+		gather(a.UserID)
+		break // 一个账号的目录就代表该租户的可用模型，不必逐个拉
+	}
+	return ids
 }
 
 func (s *Server) warmModels(pick *store.Account) {
@@ -754,9 +861,26 @@ func (s *Server) handleHuaweiModels(w http.ResponseWriter, r *http.Request) {
 	// Cursor times out if this waits on agent-center. Always return a valid
 	// OpenAI list immediately; refresh catalog in the background.
 	pick := s.firstCredAccount(apiKeyFromRequest(r))
-	ids := s.collectedModelIDs()
+	ids := s.collectedModelIDs(r.Context())
+	// 诊断用：国内模型数量是 0 时，到底是「没有国内账号」还是「目录拉不到」，
+	// 从响应头就能分辨，不用去翻日志。
+	if n := countPrefixed(ids, modelPrefixCN); n == 0 {
+		w.Header().Set("X-CN-Catalog", "empty")
+	} else {
+		w.Header().Set("X-CN-Catalog", strconv.Itoa(n)+" models")
+	}
 	writeJSON(w, http.StatusOK, huawei.OpenAIModelsList(ids))
 	go s.warmModels(pick)
+}
+
+func countPrefixed(ids []string, prefix string) int {
+	n := 0
+	for _, id := range ids {
+		if strings.HasPrefix(id, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // debugHeaders 控制是否把内部账号 ID 回显给调用方。默认关闭：

@@ -15,6 +15,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"go-codearts/internal/cnauth"
@@ -123,6 +124,15 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 			for _, m := range infos {
 				if m.ID != "" {
 					modelSet[m.ID]++
+				}
+			}
+		} else if len(a.Models) > 0 {
+			// 目录还没发现（冷启动 / 拉取失败）时，账号自身记录的模型名
+			// 也要显示出来，否则面板一片空白，看着像国内渠道没接上。
+			v.ModelCount = len(a.Models)
+			for _, m := range a.Models {
+				if m = strings.TrimSpace(m); m != "" {
+					modelSet[m]++
 				}
 			}
 		}

@@ -9,6 +9,7 @@ package api
 import (
 	"net/http"
 	"sort"
+	"strings"
 
 	"go-codearts/internal/cnup"
 	"go-codearts/internal/huawei"
@@ -34,19 +35,24 @@ func (s *Server) handleModelsCatalog(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			continue
 		}
-		if store.NormalizeChannel(a.Channel) == store.ChannelCN {
+		if store.IsCNAccount(a) {
 			cnAccounts++
-			infos, ok := cnup.AccountModels(a.UserID)
-			if !ok {
+			if infos, ok := cnup.AccountModels(a.UserID); ok {
+				for _, m := range infos {
+					if m.ID == "" {
+						continue
+					}
+					cn[m.ID]++
+					if m.Benefit {
+						cnBenefit[m.ID] = true
+					}
+				}
 				continue
 			}
-			for _, m := range infos {
-				if m.ID == "" {
-					continue
-				}
-				cn[m.ID]++
-				if m.Benefit {
-					cnBenefit[m.ID] = true
+			// 目录未发现时回退到账号自身记录的模型名，别让国内分组空白。
+			for _, m := range a.Models {
+				if m = strings.TrimSpace(m); m != "" {
+					cn[m]++
 				}
 			}
 			continue
@@ -76,7 +82,7 @@ func (s *Server) handleModelsCatalog(w http.ResponseWriter, r *http.Request) {
 
 	intlRows := make([]modelRow, 0, len(intl))
 	for id, n := range intl {
-		intlRows = append(intlRows, modelRow{ID: id, Accounts: n, Fallback: fallback[id]})
+		intlRows = append(intlRows, modelRow{ID: id, Prefixed: modelPrefixGlobal + id, Accounts: n, Fallback: fallback[id]})
 	}
 	sort.Slice(intlRows, func(i, j int) bool {
 		if intlRows[i].Accounts != intlRows[j].Accounts {
@@ -87,7 +93,7 @@ func (s *Server) handleModelsCatalog(w http.ResponseWriter, r *http.Request) {
 
 	cnRows := make([]modelRow, 0, len(cn))
 	for id, n := range cn {
-		cnRows = append(cnRows, modelRow{ID: id, Prefixed: "cn:" + id, Accounts: n, Benefit: cnBenefit[id]})
+		cnRows = append(cnRows, modelRow{ID: id, Prefixed: modelPrefixCN + id, Accounts: n, Benefit: cnBenefit[id]})
 	}
 	sort.Slice(cnRows, func(i, j int) bool {
 		if cnRows[i].Accounts != cnRows[j].Accounts {

@@ -18,6 +18,36 @@ const (
 )
 
 // NormalizeChannel returns the effective channel; empty legacy rows are intl.
+// IsCNAccount 判定账号是否属于国内码道渠道。
+//
+// NormalizeChannel("") 一律返回 intl，于是 Channel 字段缺失的账号
+// （手写 accounts.json、早期导入、跨版本迁移）即便带着 user_id 与
+// cloud_dragon_token，也会被归到国际侧：模型列表显示成 global:、
+// 调度把它派给国际 API，必然 401。这里用特征兜底，但显式声明过
+// 别的渠道时不推翻它。
+func IsCNAccount(a *Account) bool {
+	if a == nil {
+		return false
+	}
+	if NormalizeChannel(a.Channel) == ChannelCN {
+		return true
+	}
+	if strings.TrimSpace(a.Channel) != "" {
+		return false // 显式声明了其他渠道，尊重声明
+	}
+	// 国内登录产物必有 user_id，且 token 落在 AccessToken 或 Metadata 里。
+	if strings.TrimSpace(a.UserID) == "" {
+		return false
+	}
+	if strings.TrimSpace(a.AccessToken) != "" {
+		return true
+	}
+	if a.Metadata != nil && strings.TrimSpace(a.Metadata["cloud_dragon_token"]) != "" {
+		return true
+	}
+	return false
+}
+
 func NormalizeChannel(ch string) string {
 	if strings.TrimSpace(ch) == "" {
 		return ChannelIntl

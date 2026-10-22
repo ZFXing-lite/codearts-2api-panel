@@ -481,7 +481,11 @@ func filterAccountsByRealm(accounts []*store.Account, realm string) []*store.Acc
 	}
 	out := accounts[:0:0]
 	for _, a := range accounts {
-		if a != nil && store.NormalizeChannel(a.Channel) == realm {
+		if a == nil {
+			continue
+		}
+		isCN := store.IsCNAccount(a)
+		if (realm == store.ChannelCN) == isCN {
 			out = append(out, a)
 		}
 	}
