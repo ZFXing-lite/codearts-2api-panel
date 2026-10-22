@@ -26,33 +26,36 @@
       <div class="ver">Huawei · Go Proxy</div>
     </div>
     <nav class="nav" id="nav">
+      <div class="nav-group">通用</div>
       <a data-page="overview" class="active">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
         总览
       </a>
-      <a data-page="accounts">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        账户池
-      </a>
-      <a data-page="cn">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-        国内码道
-      </a>
-      <a data-page="proxies">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="m4.9 4.9 2.1 2.1"/><path d="m17 17 2.1 2.1"/><path d="M2 12h3"/><path d="M19 12h3"/><path d="m4.9 19.1 2.1-2.1"/><path d="m17 7 2.1-2.1"/></svg>
-        代理池
-      </a>
       <a data-page="models">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
-        模型
+        模型目录
       </a>
       <a data-page="apikeys">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
         API Key
       </a>
+      <div class="nav-group">国际版 CodeArts</div>
+      <a data-page="accounts">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        国际版账户池
+      </a>
       <a data-page="oauth">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
         CLI 授权
+      </a>
+      <a data-page="proxies">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="m4.9 4.9 2.1 2.1"/><path d="m17 17 2.1 2.1"/><path d="M2 12h3"/><path d="M19 12h3"/><path d="m4.9 19.1 2.1-2.1"/><path d="m17 7 2.1-2.1"/></svg>
+        代理池
+      </a>
+      <div class="nav-group">国内码道 · 盘古助手</div>
+      <a data-page="cn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        国内码道
       </a>
     </nav>
     <div class="side-foot">
@@ -120,7 +123,7 @@
 
     <section class="page" id="p-accounts">
       <div class="page-head">
-        <div><h2>账户池</h2><div class="sub" id="acct-sub">导入 txt / 手动添加 / Token 刷新 · 默认列出全部账号</div></div>
+        <div><h2>国际版账户池</h2><div class="sub" id="acct-sub">Snap 国际节点 · AK/SK + 额度体系 · 与国内码道账号完全分离</div></div>
         <div class="row" style="gap:8px">
           <button class="btn" onclick="refreshAll(true)">↻ 刷新额度</button>
         </div>
@@ -165,8 +168,6 @@
             <button type="button" class="seg-item" data-filter="ready">可调用</button>
             <button type="button" class="seg-item" data-filter="quota_exhausted">透支中</button>
             <button type="button" class="seg-item" data-filter="disabled">已禁用</button>
-            <button type="button" class="seg-item" data-filter="cn">国内码道</button>
-            <button type="button" class="seg-item" data-filter="intl">国际版</button>
           </div>
           <input id="acct-search" placeholder="搜索邮箱 / ID" style="min-width:200px">
           <button class="btn ghost" id="refresh-all-quota">
@@ -210,6 +211,17 @@
           <button class="btn" onclick="loadCN()">↻ 刷新</button>
         </div>
       </div>
+      <div class="card">
+        <h3>如何新增国内账号</h3>
+        <div class="muted" style="line-height:1.9">
+          国内码道是 OAuth 体系，与「国际版账户池」的邮箱+AK/SK 完全不同：<br>
+          1. 服务器执行 <code>cnlogin -auth-dir ./auths</code>，扫码或打开打印的链接授权（会写入 <code>auths/codearts-*.json</code>）<br>
+          2. 回本页点 <b>导入 auths 目录</b>，凭证入库并进入调度池<br>
+          3. 看护会自动续期 token、每日签到领积分、保活心跳；也可用行内「续期 / 签到」手动触发<br>
+          <span class="muted">容器部署时 <code>CN_AUTH_DIR</code> 指向挂载进来的 auths 目录，镜像内已带 <code>cnlogin</code> 命令。</span>
+        </div>
+      </div>
+      <div style="height:14px"></div>
       <div id="cn-off-tip" class="card" style="display:none;border-color:rgba(248,81,73,.35)">
         <h3 style="color:var(--red)">CN 渠道已关闭（CN_ENABLED=false）</h3>
         <div class="muted">国内码道账号不会进入调度池。改 <code>.env</code> 中 <code>CN_ENABLED=true</code> 并重启/热加载后生效。</div>
@@ -249,7 +261,7 @@
 
     <section class="page" id="p-proxies">
       <div class="page-head">
-        <div><h2>代理池</h2><div class="sub">独立模块 · proxies.json · sticky / 轮询 / 随机</div></div>
+        <div><h2>代理池 <span class="badge bb">国际版出站</span></h2><div class="sub">账号级 HTTP / SOCKS5 绑定 · sticky / 轮询 / 随机 · 目前仅对国际版账号生效</div></div>
         <button class="btn" onclick="loadProxies()">↻ 刷新</button>
       </div>
       <div class="card">
@@ -334,17 +346,52 @@
 
     <section class="page" id="p-models">
       <div class="page-head">
-        <div><h2>模型</h2><div class="sub">OpenAI 兼容 · GET /v1/models</div></div>
+        <div><h2>模型目录</h2><div class="sub" id="models-hint">国际版 snap-access 目录 + 国内码道检出目录（cn: 前缀）</div></div>
         <button class="btn" onclick="loadModels()">↻ 同步</button>
       </div>
       <div class="card">
-        <div class="muted" id="models-hint" style="margin-bottom:10px"></div>
+        <h3>路由规则</h3>
         <div class="tbl-wrap">
-          <table id="models-table">
-            <thead><tr><th data-sort="id">ID</th><th data-sort="object">Object</th><th data-sort="owned_by">Owned By</th></tr></thead>
-            <tbody></tbody>
+          <table class="tbl">
+            <thead><tr><th>模型名写法</th><th>走向</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>GLM-5.2</code>（无前缀）</td><td><span class="badge bb">双渠道</span></td><td>全池统一熔断/轮换/粘滞，选中哪边就走哪边协议</td></tr>
+              <tr><td><code>cn:snap-chat</code></td><td><span class="badge bo">仅国内码道</span></td><td>走盘古助手 OAuth 账号，模型名不再被国际别名表改写</td></tr>
+              <tr><td><code>intl:GLM-5.2</code> / <code>global:GLM-5.2</code></td><td><span class="badge bg">仅国际版</span></td><td>强制国际 snap 账号，无可用账号时直接失败不跨渠道</td></tr>
+            </tbody>
           </table>
         </div>
+      </div>
+
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>国际版模型 <span class="muted" id="intl-model-count"></span></h3>
+        <div class="muted" style="margin-bottom:10px">来源：上游 snap-access 目录 + 各国际账号已检出模型 + 内置兜底（<code>snap-chat</code> 等别名会映射到实际模型）。</div>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>模型 ID</th><th>可用账号</th><th>来源</th></tr></thead>
+            <tbody id="intl-models-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>国内码道模型 <span class="muted" id="cn-model-count"></span></h3>
+        <div class="muted" style="margin-bottom:10px" id="cn-models-note">每个 CN 账号首轮看护或首次请求后会拉取自己的可用模型目录（含限时福利）。请求时用 <code>cn:模型ID</code> 走国内渠道。</div>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>模型 ID</th><th>调用写法</th><th>可用账号</th><th>类型</th></tr></thead>
+            <tbody id="cn-models-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="height:14px"></div>
+      <div class="card">
+        <h3>对外 /v1/models 原始返回</h3>
+        <div class="muted" style="margin-bottom:8px">客户端实际拿到的合流目录（含 cn: 前缀条目）。</div>
+        <div id="raw-models" class="usage-strip"></div>
       </div>
     </section>
 
@@ -401,7 +448,7 @@
 
     <section class="page" id="p-oauth">
       <div class="page-head">
-        <div><h2>CLI 授权</h2><div class="sub">官方路径：IAM 永久 AK/SK → CODEARTS_CLI_AK / CODEARTS_CLI_SK</div></div>
+        <div><h2>CLI 授权 <span class="badge bb">仅国际版</span></h2><div class="sub">官方路径：IAM 永久 AK/SK → CODEARTS_CLI_AK / CODEARTS_CLI_SK · 国内码道不走此流程（用 cnlogin）</div></div>
       </div>
       <div class="card">
         <h3>1. 官方永久 AK/SK（推荐）</h3>

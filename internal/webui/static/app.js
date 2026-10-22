@@ -139,6 +139,7 @@ function expireText(q) {
 }
 
 let _acctFilter = "all";
+let _allAccountsCache = null; // 全池（国际+国内），供总览快览与 Key 选号复用
 let _acctSearch = "";
 let _accountsCache = [];
 
@@ -516,6 +517,21 @@ async function loadDashboard() {
     { icon: "🧯", bg: "rgba(248,81,73,.12)", val: ph.circuit_open ?? 0, key: "熔断开数", trend: `半开 ${ph.circuit_half ?? 0}`, cls: "stat-disabled" },
     { icon: "💾", bg: "rgba(125,211,252,.12)", val: localHit, key: "缓存命中率", trend: cacheNote },
   ];
+  // 渠道健康：国际版 / 国内码道各自的 ready / 透支 / 账号数
+  {
+    const cnS = (d.channel_stats || {}).cn || {};
+    const intlS = (d.channel_stats || {}).intl || {};
+    health.push({
+      icon: "🌐", bg: "rgba(78,168,255,.12)",
+      val: `${intlS.ready || 0}/${intlS.accounts || 0}`, key: "国际版 Ready",
+      trend: `透支 ${intlS.depleted || 0} · 禁用 ${intlS.disabled || 0}`,
+    });
+    health.push({
+      icon: "🀄", bg: "rgba(210,153,34,.12)",
+      val: `${cnS.ready || 0}/${cnS.accounts || 0}`, key: "国内码道 Ready",
+      trend: `透支 ${cnS.depleted || 0} · 禁用 ${cnS.disabled || 0}`,
+    });
+  }
   if ($("health-stats")) {
     $("health-stats").innerHTML = health
       .map(
@@ -727,8 +743,13 @@ async function setAccountProxy(id, proxy_id) {
 }
 
 async function loadAccounts() {
-  const list = await api("/api/accounts");
+  // 账户池 = 国际版专属视图；国内码道账号在「国内码道」页管理。
+  const [list, all] = await Promise.all([
+    api("/api/accounts?channel=intl"),
+    api("/api/accounts").catch(() => null),
+  ]);
   _accountsCache = list || [];
+  if (all) _allAccountsCache = all;
   if (!window._proxies) {
     try {
       const d = await api("/api/proxies");
@@ -771,8 +792,7 @@ function renderAccounts() {
     if (_acctFilter === "ready" && !(g === "ready" || g === "quota_exhausted")) return false;
     if (_acctFilter === "quota_exhausted" && g !== "quota_exhausted") return false;
     if (_acctFilter === "disabled" && !(!!a.disabled || g === "disabled")) return false;
-    if (_acctFilter === "cn" && a.channel !== "cn") return false;
-    if (_acctFilter === "intl" && a.channel === "cn") return false;
+
     if (q) {
       const hay = `${a.email || ""} ${a.id || ""}`.toLowerCase();
       if (!hay.includes(q)) return false;
@@ -840,7 +860,8 @@ function renderAccounts() {
   fillAcctBatchProxySelect();
 
   if (mini) {
-    const list = _accountsCache || [];
+    // 快览是全池视角（国际 + 国内），rows 会带渠道徽标
+    const list = _allAccountsCache || _accountsCache || [];
     if (!list.length) { mini.innerHTML = `<div class="empty">暂无账号</div>`; return; }
     const rows = list.map((a) => {
       const okN = a.success_count ?? 0;
@@ -934,182 +955,67 @@ async function refreshAllQuotas() {
   }
 }
 
-let _modelsCache = [];
-
-function modelSortValue(key, m) {
-  switch (key) {
-    case "id":
-      return (m.id || "").toLowerCase();
-    case "object":
-      return (m.object || "").toLowerCase();
-    case "owned_by":
-      return (m.owned_by || "").toLowerCase();
-    default:
-      return "";
-  }
-}
-
-function renderModelsTable() {
-  const tb = document.querySelector("#models-table tbody");
-  if (!tb) return;
-  const sorted = applySort("models-table", _modelsCache || [], modelSortValue);
-  tb.innerHTML = sorted.length
-    ? sorted.map((m) => `<tr><td><b>${esc(m.id)}</b></td><td>${esc(m.object || "model")}</td><td>${esc(m.owned_by || "—")}</td></tr>`).join("")
-    : `<tr><td colspan="3" class="empty">无模型</td></tr>`;
-}
-
 async function loadModels() {
+  // 管理端双渠道目录（含可用账号数与福利标记）
+  let d = null;
   try {
-    const res = await fetch(BASE + "/v1/models", { credentials: "same-origin" });
-    const d = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const msg = d.error || res.statusText || "load failed";
-      $("models-hint").textContent =
-        res.status === 401
-          ? `需要 API Key（或重新登录管理后台）。${msg}`
-          : msg;
-      _modelsCache = [];
-      const tb = document.querySelector("#models-table tbody");
-      if (tb) tb.innerHTML = `<tr><td colspan="3" class="empty">${esc(msg)}</td></tr>`;
-      return;
-    }
-    _modelsCache = d.data || [];
-    $("models-hint").textContent = d.warning || d.message || `共 ${_modelsCache.length} 个模型`;
-    renderModelsTable();
+    d = await api("/api/models/catalog");
   } catch (e) {
-    $("models-hint").textContent = e.message;
-  }
-}
-
-// ── 国内码道（CN 渠道）面板 ──────────────────────────────
-let _cnCache = null;
-
-function cnTokenBadge(v) {
-  const map = {
-    ok: ["bg", "正常"],
-    due: ["bo", "将到期"],
-    expired: ["br", "已过期"],
-    none: ["bb", "无"],
-  };
-  const [cls, label] = map[v.token_state] || ["bb", v.token_state || "—"];
-  const exp = v.token_expires ? `<div class="muted" style="font-size:11px">${esc(fmtTime(v.token_expires))}</div>` : "";
-  return `<span class="badge ${cls}">${label}</span>${exp}`;
-}
-
-async function loadCN() {
-  let d;
-  try {
-    d = await api("/api/cn/dashboard");
-  } catch (e) {
-    toast("CN 状态加载失败: " + e.message);
+    $("models-hint").textContent = "目录加载失败: " + e.message;
     return;
   }
-  _cnCache = d;
+  const intl = d.intl || [];
+  const cn = d.cn || [];
 
-  $("cn-off-tip").style.display = d.enabled ? "none" : "block";
-  $("cn-sub").textContent =
-    `账号 ${d.accounts || 0} · 可调用 ${d.callable || 0} · 待重登 ${d.needs_relogin || 0}` +
-    ` · Token 临期 ${d.token_due || 0} · 今日签到 ${d.checkin_today || 0}` +
-    (d.last_active ? ` · 最近活动 ${fmtTime(d.last_active)}` : "");
+  $("models-hint").textContent =
+    `国际版 ${d.intl_total || 0} 个模型 · 国内码道 ${d.cn_total || 0} 个模型（${d.cn_accounts || 0} 个 CN 账号检出）` +
+    (d.cn_enabled ? "" : " · CN 渠道已关闭");
 
-  const cards = [
-    { icon: "🀄", bg: "rgba(210,153,34,.12)", val: d.enabled ? "已启用" : "已关闭", key: "CN 渠道", trend: `auths ${d.auth_file_count || 0} 个凭证` },
-    { icon: "👥", bg: "rgba(78,168,255,.12)", val: d.accounts || 0, key: "CN 账号", trend: `可调用 ${d.callable || 0}` },
-    { icon: "🔑", bg: "rgba(248,81,73,.12)", val: d.needs_relogin || 0, key: "待重新登录", trend: `Token 临期 ${d.token_due || 0}` },
-    { icon: "🎁", bg: "rgba(63,185,80,.12)", val: `${d.checkin_today || 0}/${d.accounts || 0}`, key: "今日已签到", trend: d.today || "" },
-  ];
-  $("cn-stats").innerHTML = cards
-    .map((c) =>
-      `<div class="stat"><div class="icon" style="background:${c.bg}">${c.icon}</div>` +
-      `<div class="val">${esc(c.val)}</div><div class="key">${esc(c.key)}</div>` +
-      `<div class="trend">${esc(c.trend || "")}</div></div>`)
-    .join("");
+  $("intl-model-count").textContent = `(${intl.length})`;
+  $("intl-models-body").innerHTML = intl.length
+    ? intl.map((m) => `<tr>
+        <td><b>${esc(m.id)}</b></td>
+        <td>${m.accounts > 0 ? `<span class="badge bg">${m.accounts}</span>` : `<span class="muted">—</span>`}</td>
+        <td>${m.fallback ? '<span class="badge bb">内置兜底</span>' : '<span class="badge bg">上游目录</span>'}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="3" class="empty">尚未同步国际模型目录（点右上「同步」或等上游探测）</td></tr>`;
 
-  $("cn-acct-count").textContent = `(${d.accounts || 0})`;
-  const rows = (d.account_views || []).map((v) => {
-    const gate = `<span class="badge ${v.call_gate === "ready" ? "bg" : (v.call_gate === "quota_exhausted" ? "bo" : "bb")}">${esc(v.call_gate || "—")}</span>` +
-      (v.needs_relogin ? ` <span class="badge br">需重登</span>` : "") +
-      (v.disabled ? ` <span class="badge bb">已禁用</span>` : "");
-    const errLine = v.last_error ? `<div class="muted" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.last_error)}">${esc(v.last_error)}</div>` : "";
-    const checkin = v.checkin_date
-      ? `<span class="badge bg">✓ ${esc(v.checkin_date)}</span><div class="muted" style="font-size:11px" title="${esc(v.checkin_msg || "")}">${esc(v.checkin_msg || "")}</div>`
-      : `<span class="badge bb">未签</span>`;
-    return `<tr>
-      <td><div class="email" title="${esc(v.email)}">${esc(v.email || v.id)}</div>${errLine}</td>
-      <td class="nowrap"><span class="muted" style="font-size:11px">${esc(v.user_id || "—")}</span></td>
-      <td>${gate}</td>
-      <td>${cnTokenBadge(v)}</td>
-      <td>${checkin}</td>
-      <td class="nowrap">${esc(fmtTime(v.last_active || v.last_keepalive || ""))}</td>
-      <td class="nowrap"><span class="badge bg">${v.success_count || 0}</span> / <span class="badge ${v.fail_count ? "br" : "bb"}">${v.fail_count || 0}</span></td>
-      <td class="nowrap">
-        <div class="ops">
-          <button class="btn sm" onclick="cnRefreshToken('${esc(v.id)}')">续期</button>
-          <button class="btn sm" onclick="cnCheckin('${esc(v.id)}')">签到</button>
-          ${v.needs_relogin ? `<button class="btn sm" onclick="cnClearRelogin('${esc(v.id)}')">清重登标记</button>` : ""}
-        </div>
-      </td>
-    </tr>`;
-  });
-  $("cn-acct-body").innerHTML = rows.length
-    ? rows.join("")
-    : `<tr><td colspan="8" class="empty">暂无 CN 账号。用 <code>cnlogin</code> 登录后点「导入 auths 目录」，或把 auths/*.json 放进 CN_AUTH_DIR。</td></tr>`;
-
-  const models = d.models || [];
-  $("cn-models").innerHTML = models.length
-    ? models.map((m) =>
-        `<span class="usage-pill" title="${esc(m.id)} · ${m.accounts} 个账号可用">` +
-        `<b>${esc(m.prefixed)}</b>${m.benefit ? ' <span class="badge bo">福利</span>' : ""}` +
-        ` <span class="muted">×${m.accounts}</span></span>`).join("")
-    : `<div class="empty">CN 账号尚未检出模型目录（首轮看护或任意一次 CN 请求后自动拉取）。</div>`;
-
-  $("cn-config").innerHTML = (d.config || [])
-    .map((c) => `<tr><td class="nowrap"><code>${esc(c.key)}</code></td><td>${esc(c.label)}</td><td class="nowrap">${esc(c.value || "—")}</td></tr>`)
-    .join("");
-}
-
-async function cnImportAuths() {
-  try {
-    const r = await api("/api/cn/import", { method: "POST", body: "{}" });
-    toast(`已导入 ${r.imported || 0} 个 CN 账号`);
-    await loadCN();
-  } catch (e) {
-    toast("导入失败: " + e.message);
+  $("cn-model-count").textContent = `(${cn.length})`;
+  const cnNote = $("cn-models-note");
+  if (!d.cn_enabled) {
+    cnNote.innerHTML = `CN 渠道已关闭（<code>CN_ENABLED=false</code>），国内模型不参与调度。`;
+  } else if ((d.cn_accounts || 0) === 0) {
+    cnNote.innerHTML = `还没有国内码道账号。先用 <code>cnlogin</code> 登录，再到「国内码道」页一键导入 auths 目录。`;
+  } else if (cn.length === 0) {
+    cnNote.innerHTML = `CN 账号已就位，模型目录将在首轮看护或首次 <code>cn:</code> 请求后自动拉取。`;
+  } else {
+    cnNote.innerHTML = `每个 CN 账号首轮看护或首次请求后会拉取自己的可用模型目录。请求时用 <code>cn:模型ID</code> 走国内渠道。`;
   }
-}
+  $("cn-models-body").innerHTML = cn.length
+    ? cn.map((m) => `<tr>
+        <td><b>${esc(m.id)}</b></td>
+        <td><code class="muted">${esc(m.prefixed)}</code></td>
+        <td>${m.accounts > 0 ? `<span class="badge bg">${m.accounts}</span>` : "—"}</td>
+        <td>${m.benefit ? '<span class="badge bo">限时福利</span>' : '<span class="badge bb">常规</span>'}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="4" class="empty">暂无国内模型目录</td></tr>`;
 
-async function cnRefreshToken(id) {
+  // 原始 /v1/models 以 pill 展示（客户端真实拿到的合流结果）
   try {
-    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/refresh`, { method: "POST", body: "{}" });
-    toast("续期成功，到期 " + fmtTime(r.token_expires || ""));
+    const res = await fetch(BASE + "/v1/models", { credentials: "same-origin" });
+    const raw = await res.json().catch(() => ({}));
+    const list = (raw.data || []).map((m) => m.id || "");
+    $("raw-models").innerHTML = list.length
+      ? list.map((id) => `<span class="usage-pill"><b>${esc(id)}</b></span>`).join("")
+      : `<div class="empty">${esc(raw.error || "无返回")}</div>`;
   } catch (e) {
-    toast("续期失败: " + e.message);
+    $("raw-models").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
-  loadCN();
-}
-
-async function cnCheckin(id) {
-  try {
-    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/checkin`, { method: "POST", body: "{}" });
-    toast(`签到完成：${r.message || "ok"}${r.credits ? ` · +${r.credits} 积分` : ""}`);
-  } catch (e) {
-    toast("签到失败: " + e.message);
-  }
-  loadCN();
-}
-
-async function cnClearRelogin(id) {
-  try {
-    await api(`/api/cn/accounts/${encodeURIComponent(id)}/relogin-clear`, { method: "POST", body: "{}" });
-    toast("已清除重登标记");
-  } catch (e) {
-    toast("操作失败: " + e.message);
-  }
-  loadCN();
 }
 
 async function fillOAuthAccounts() {
-  const list = await api("/api/accounts");
+  // CLI 授权是国际版专属流程（IAM AK/SK）；国内码道走 cnlogin，不在此列
+  const list = await api("/api/accounts?channel=intl");
   const sel = $("oauth-account");
   window._oauthAccounts = list || [];
   sel.innerHTML = list.map((a) => `<option value="${esc(a.id)}">${esc(a.email)}</option>`).join("");
@@ -1653,22 +1559,27 @@ function keyScopeIsPick() {
   return document.querySelector('input[name="key-scope"]:checked')?.value === "pick";
 }
 
-function fillKeyAccountPicker(selected) {
+async function fillKeyAccountPicker(selected) {
   const box = $("key-acct-list");
   if (!box) return;
   const sel = new Set(selected || []);
-  const items = _accountsCache || [];
+  // API Key 可绑定全池（国际 + 国内），单独拉全量而不是复用国际版账户池缓存
+  let items = _accountsCache || [];
+  try {
+    items = await api("/api/accounts");
+  } catch (_) {}
   box.hidden = !keyScopeIsPick();
   if (!items.length) {
-    box.innerHTML = `<div class="empty">还没有账号，先去账户池导入</div>`;
+    box.innerHTML = `<div class="empty">还没有账号，先去账户池 / 国内码道导入</div>`;
     return;
   }
   box.innerHTML = items.map((a) => {
     const g = a.call_gate || "";
     const checked = sel.has(a.id) ? "checked" : "";
+    const cn = a.channel === "cn" ? ' <span class="badge cn">CN</span>' : "";
     return `<label class="pick-row" data-gate="${esc(g)}">
       <input type="checkbox" value="${esc(a.id)}" ${checked}>
-      <span>${esc(a.email || a.id)}</span>
+      <span>${esc(a.email || a.id)}${cn}</span>
       <span>${badge(g)}</span>
     </label>`;
   }).join("");
@@ -1990,7 +1901,6 @@ $("px-import-btn")?.addEventListener("click", async () => {
 bindSortableHeaders("accounts-table", acctSortValue, renderAccounts);
 bindSortableHeaders("proxies-table", proxySortValue, renderProxiesTable);
 bindSortableHeaders("apikeys-table", apikeySortValue, renderAPIKeysTable);
-bindSortableHeaders("models-table", modelSortValue, renderModelsTable);
 
 try {
   init();

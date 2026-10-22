@@ -336,3 +336,103 @@ func TestCNReloginClear(t *testing.T) {
 		t.Fatalf("flag not cleared: %+v", acc.Metadata)
 	}
 }
+
+// 双渠道模型目录：CN 目录按 UserID 关联（曾误用账号 ID 导致面板恒空），
+// 国际/国内分区互不污染。
+func TestModelsCatalogSplitsChannels(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := store.Open(dir)
+	authMgr, _ := auth.New("admin", "pass")
+	s := New(config.Config{CNEnabled: true, DataDir: dir}, db, authMgr, nil)
+
+	db.Upsert(&store.Account{
+		ID: "intl-1", Email: "i@intl", Models: []string{"GLM-5.2", "DeepSeek-V3"},
+		Credentials: &store.Credentials{AccessKeyID: "ak", SecretAccessKey: "sk"},
+	})
+	db.Upsert(&store.Account{
+		ID: "cn-acc-1", Channel: store.ChannelCN, Email: "c@cn",
+		UserID: "uid-777", AccessToken: "tok",
+	})
+	// 目录缓存的 key 是 UserID，不是账号 ID
+	cnup.SetAccountModels("uid-777", []cnup.ModelInfo{
+		{ID: "Qwen3-VL-235B"},
+		{ID: "benefit-model-0915", Benefit: true},
+	})
+
+	w := httptest.NewRecorder()
+	s.handleModelsCatalog(w, httptest.NewRequest(http.MethodGet, "/api/models/catalog", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var d struct {
+		Intl []struct {
+			ID       string `json:"id"`
+			Accounts int    `json:"accounts"`
+		} `json:"intl"`
+		CN []struct {
+			ID       string `json:"id"`
+			Prefixed string `json:"prefixed"`
+			Accounts int    `json:"accounts"`
+			Benefit  bool   `json:"benefit"`
+		} `json:"cn"`
+		CNAccounts int `json:"cn_accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.CNAccounts != 1 {
+		t.Fatalf("cn_accounts=%d", d.CNAccounts)
+	}
+	if len(d.CN) != 2 {
+		t.Fatalf("cn models=%d want 2 (UserID keyed catalog)", len(d.CN))
+	}
+	var sawBenefit, sawPrefixed bool
+	for _, m := range d.CN {
+		if m.ID == "benefit-model-0915" && m.Benefit {
+			sawBenefit = true
+		}
+		if m.Prefixed == "cn:"+m.ID {
+			sawPrefixed = true
+		}
+		if m.ID == "GLM-5.2" {
+			t.Fatal("intl model leaked into CN section")
+		}
+	}
+	if !sawBenefit || !sawPrefixed {
+		t.Fatalf("benefit=%v prefixed=%v", sawBenefit, sawPrefixed)
+	}
+	// 注意：国际兜底目录可能含同名模型（如 Qwen3-VL-235B），这是合法的
+	// 别名可达；只断言 CN 独有的福利模型没有串到国际区。
+	for _, m := range d.Intl {
+		if m.ID == "benefit-model-0915" {
+			t.Fatal("cn-only benefit model leaked into intl section")
+		}
+	}
+}
+
+// 账户池按渠道过滤：国际池不能出现国内账号。
+func TestAccountsChannelFilter(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := store.Open(dir)
+	authMgr, _ := auth.New("admin", "pass")
+	s := New(config.Config{CNEnabled: true, DataDir: dir}, db, authMgr, nil)
+	db.Upsert(&store.Account{ID: "intl-1", Email: "i@intl",
+		Credentials: &store.Credentials{AccessKeyID: "ak", SecretAccessKey: "sk"}})
+	db.Upsert(&store.Account{ID: "cn-1", Channel: store.ChannelCN, Email: "c@cn",
+		UserID: "uid-1", AccessToken: "tok"})
+
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{{"", 2}, {"?channel=intl", 1}, {"?channel=cn", 1}} {
+		w := httptest.NewRecorder()
+		s.handleAccounts(w, httptest.NewRequest(http.MethodGet, "/api/accounts"+tc.query, nil))
+		var list []map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+			t.Fatalf("%s: %v body=%s", tc.query, err, w.Body.String())
+		}
+		if len(list) != tc.want {
+			t.Fatalf("%q: got %d accounts want %d", tc.query, len(list), tc.want)
+		}
+	}
+}

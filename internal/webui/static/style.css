@@ -164,6 +164,16 @@ body::before {
   font-weight: 600;
 }
 .nav svg { width: 16px; height: 16px; flex-shrink: 0; }
+/* 侧栏渠道分组标题：通用 / 国际版 / 国内码道 */
+.nav-group {
+  padding: 14px 12px 6px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(139, 148, 158, 0.75);
+  font-weight: 600;
+}
+.nav-group:first-child { padding-top: 2px; }
 .side-foot {
   padding: 14px 20px;
   border-top: 1px solid var(--border);

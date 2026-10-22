@@ -118,7 +118,7 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 		if t := cnParseTime(v.LastActive); t.After(lastActive) {
 			lastActive = t
 		}
-		if infos, ok := cnup.AccountModels(a.ID); ok {
+		if infos, ok := cnup.AccountModels(a.UserID); ok {
 			v.ModelCount = len(infos)
 			for _, m := range infos {
 				if m.ID != "" {
@@ -332,7 +332,7 @@ func (s *Server) handleCNModels(w http.ResponseWriter, r *http.Request) {
 		if a == nil || store.NormalizeChannel(a.Channel) != store.ChannelCN {
 			continue
 		}
-		if infos, ok := cnup.AccountModels(a.ID); ok {
+		if infos, ok := cnup.AccountModels(a.UserID); ok {
 			for _, m := range infos {
 				if m.ID != "" {
 					seen[m.ID]++

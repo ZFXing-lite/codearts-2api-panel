@@ -347,6 +347,7 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("PUT /api/accounts/{id}/proxy", s.handleSetAccountProxy)
 
 	// 国内码道（CN 渠道）面板 API — 见 cnpanel.go
+	mux.HandleFunc("GET /api/models/catalog", s.handleModelsCatalog)
 	mux.HandleFunc("GET /api/cn/dashboard", s.handleCNDashboard)
 	mux.HandleFunc("POST /api/cn/import", s.handleCNImport)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/refresh", s.handleCNRefresh)
@@ -2044,6 +2045,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Accounts int `json:"accounts"`
 		Callable int `json:"callable"`
 		Disabled int `json:"disabled"`
+		Ready    int `json:"ready"`
+		Depleted int `json:"depleted"`
 	}
 	chanStats := map[string]*chanStat{"intl": {}, "cn": {}}
 	statFor := func(a *store.Account) *chanStat {
@@ -2064,7 +2067,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		if a.Disabled {
 			cs.Disabled++
 		}
+		if a.CallGate == store.CallGateReady {
+			cs.Ready++
+		}
 		if a.CallGate == store.CallGateQuotaExhausted {
+			cs.Depleted++
 			exhausted++
 		}
 		if a.Disabled || a.CallGate == store.CallGateDisabled {
@@ -2263,6 +2270,17 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	// Compute call gates from live accounts before redaction; clearing secrets first
 	// would make every account appear no_cred in the dashboard.
 	list := s.db.SnapshotList() // deep copies — safe to mutate display fields (BUG-6 fix)
+	// 渠道过滤：面板「国际版账户池」只拉 intl；CN 走 /api/cn/dashboard。
+	// 默认 all 保持向后兼容（API Key 选号等需要全池）。
+	if want := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("channel"))); want == "intl" || want == "cn" {
+		filtered := list[:0:0]
+		for _, a := range list {
+			if a != nil && store.NormalizeChannel(a.Channel) == want {
+				filtered = append(filtered, a)
+			}
+		}
+		list = filtered
+	}
 	now := time.Now()
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	stickCounts := map[string]int{}
@@ -2278,6 +2296,8 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.RecomputeCallGate(now)
+		// 空 channel 是历史存量（等价 intl）；归一化后前端不必做 null 兜底。
+		a.Channel = store.NormalizeChannel(a.Channel)
 		a.StickSessions = stickCounts[a.ID]
 		if s.circuit != nil {
 			a.Circuit = s.circuit.State(a.ID)
