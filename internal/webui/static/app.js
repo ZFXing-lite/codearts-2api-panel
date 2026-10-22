@@ -1374,6 +1374,7 @@ $("acct-search")?.addEventListener("input", (e) => {
 });
 
 $("refresh-all-quota")?.addEventListener("click", (ev) => refreshAllQuotas(ev.currentTarget));
+$("cn-credit-refresh")?.addEventListener("click", () => cnFetchCreditAll());
 
 function proxyForm() {
   return {
@@ -2026,20 +2027,23 @@ function cnTokenBadge(v) {
 // 余额要 CN_BILLING_* 配置才能查（华为 CodeArts 没有公开固定端点），
 // 所以「未知」必须显式写出来，不能显示成 0——那是错的信息。
 function cnCreditCell(v) {
+  const c = (_cnCache && _cnCache.credits) || {};
+  const btn = c.configured
+    ? ` <button class="btn sm" title="重新查询该账号余额" onclick="cnFetchCredit('${esc(v.id)}')">查</button>`
+    : "";
   if (v.credit_known) {
     const bug = v.credit_error ? ` <span class="badge br" title="${esc(v.credit_error)}">查询异常</span>` : "";
     const when = v.credit_fetched ? `更新 ${fmtTime(v.credit_fetched)}` : "";
-    return `<span class="badge bg">${v.credit_remain}</span>` + bug +
+    return `<span class="badge bg">${v.credit_remain}</span>` + bug + btn +
       `<div class="muted" style="font-size:11px">${esc(when)}</div>`;
   }
   if (v.credit_error) {
-    return `<span class="badge bb">未知</span>` +
+    return `<span class="badge bb">未知</span>` + btn +
       `<div class="muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.credit_error)}">${esc(v.credit_error)}</div>`;
   }
-  const c = (_cnCache && _cnCache.credits) || {};
   return c.configured
-    ? `<span class="badge bb">未知</span>`
-    : `<span class="muted" style="font-size:11px">未启用</span>`;
+    ? `<span class="badge bb">未知</span>` + btn
+    : `<span class="muted" style="font-size:11px" title="需配置 CN_BILLING_BASE_URL 与 CN_BILLING_PRODUCT_CODE">未启用</span>`;
 }
 
 function cnCreditCard(c) {
@@ -2052,6 +2056,29 @@ function cnCreditCard(c) {
     icon: "💎", bg: "rgba(139,148,158,.12)", val, key: "池子总积分",
     trend, title: c.hint || "",
   };
+}
+
+// 手动查一个账号的积分余额。
+async function cnFetchCredit(id) {
+  try {
+    const r = await api(`/api/cn/accounts/${encodeURIComponent(id)}/credits`, { method: "POST", body: "{}" });
+    toast(`余额 ${r.credit_remain} 积分`);
+    loadCN();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+// 刷新整个池子的余额。未配置时后端直接 400 并说明缺什么，这里照实提示。
+async function cnFetchCreditAll() {
+  try {
+    const r = await api("/api/cn/credits/refresh", { method: "POST", body: "{}" });
+    const miss = (r.accounts || 0) - (r.known || 0);
+    toast(`余额已刷新：${r.known || 0} 个成功${miss > 0 ? `，${miss} 个失败` : ""}，合计 ${r.pool_total || 0}`);
+    loadCN();
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 async function loadCN() {
@@ -2134,12 +2161,16 @@ async function loadCN() {
 let _cnLoginID = null;
 let _cnLoginTimer = null;
 
-function cnLoginReset() {
+// keepBox=true 时保留登录盒可见：成功提示写在盒内，
+// 先隐藏再写等于把结果藏起来，用户只会以为"点了没反应"。
+function cnLoginReset(keepBox) {
   if (_cnLoginTimer) clearInterval(_cnLoginTimer);
   _cnLoginTimer = null;
   _cnLoginID = null;
-  const box = $("cn-login-box");
-  if (box) box.style.display = "none";
+  if (!keepBox) {
+    const box = $("cn-login-box");
+    if (box) box.style.display = "none";
+  }
   const cancel = $("cn-login-cancel");
   if (cancel) cancel.style.display = "none";
 }
@@ -2175,7 +2206,7 @@ async function cnLoginPoll() {
       // 先落提示再收起登录盒：cnLoginReset() 会把整个盒子隐藏，
       // 之后写进去的成功文案用户根本看不到，只会看到面板"没反应"。
       const who = a.name || a.uid || a.email || "";
-      cnLoginReset();
+      cnLoginReset(true); // 保留盒子，否则下面的成功文案看不见
       if (status) status.textContent = `登录成功：${who}（凭据已入库）`;
       toast(`国内码道账号已添加${who ? "：" + who : ""}`);
       loadCN();

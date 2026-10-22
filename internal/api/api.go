@@ -377,6 +377,8 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("POST /api/cn/accounts/{id}/refresh", s.handleCNRefresh)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/checkin", s.handleCNCheckin)
 	mux.HandleFunc("POST /api/cn/accounts/{id}/relogin-clear", s.handleCNReloginClear)
+	mux.HandleFunc("POST /api/cn/accounts/{id}/credits", s.handleCNCredit)
+	mux.HandleFunc("POST /api/cn/credits/refresh", s.handleCNCreditRefreshAll)
 	mux.HandleFunc("GET /api/cn/models", s.handleCNModels)
 
 	mux.HandleFunc("GET /api/apikeys", s.handleListAPIKeys)

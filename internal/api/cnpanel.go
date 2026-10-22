@@ -12,11 +12,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"go-codearts/internal/kit"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go-codearts/internal/cnauth"
@@ -425,3 +428,130 @@ func cnBoolZh(b bool) string {
 
 // cnIsAuthFile 复用 cnauth 判定，避免与 CLI 的命名规则漂移。
 func cnIsAuthFile(name string) bool { return cnauth.IsAuthFile(name) }
+
+// cnBillingConfig 组装余额查询配置。
+func (s *Server) cnBillingConfig() cnup.BillingConfig {
+	return cnup.BillingConfig{
+		BaseURL:     s.cfg.CNBillingBaseURL,
+		ProductCode: s.cfg.CNBillingProductCode,
+		MeterPath:   s.cfg.CNBillingMeterPath,
+	}
+}
+
+// refreshCNCredit 查一个账号的积分余额并写回 Metadata。
+// 返回余额与是否已知（未配置时为 false，不视为错误）。
+func (s *Server) refreshCNCredit(ctx context.Context, acc *store.Account) (int64, bool, error) {
+	bcfg := s.cnBillingConfig()
+	if !bcfg.Configured() {
+		return 0, false, cnup.ErrBillingNotConfigured
+	}
+	cred := cnup.SignCredential{}
+	if acc.Credentials != nil {
+		cred.AccessKeyID = acc.Credentials.AccessKeyID
+		cred.SecretAccessKey = acc.Credentials.SecretAccessKey
+		cred.SecurityToken = acc.Credentials.SecurityToken
+	}
+	if cred.SecurityToken == "" {
+		cred.SecurityToken = acc.AccessToken
+	}
+	if cred.SecurityToken == "" && cred.AccessKeyID == "" {
+		return 0, false, errors.New("账号没有可用凭据（access_token / AK-SK 都为空）")
+	}
+	bal, err := s.cnUpstream().FetchCreditBalance(ctx, bcfg, cred)
+	if err != nil {
+		_ = s.db.Mutate(acc.ID, func(fresh *store.Account) error {
+			if fresh.Metadata == nil {
+				fresh.Metadata = map[string]string{}
+			}
+			fresh.Metadata[cnwatch.MetaCreditErr] = kit.Snippet(err.Error(), 200)
+			return nil
+		})
+		return 0, false, err
+	}
+	var pk []byte
+	if len(bal.Packages) > 0 {
+		pk, _ = json.Marshal(bal.Packages)
+	}
+	remain := bal.Remain
+	at := bal.FetchedAt.Format(time.RFC3339)
+	_ = s.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata[cnwatch.MetaCreditRemain] = strconv.FormatInt(remain, 10)
+		fresh.Metadata[cnwatch.MetaCreditFetched] = at
+		fresh.Metadata[cnwatch.MetaCreditPackages] = string(pk)
+		delete(fresh.Metadata, cnwatch.MetaCreditErr)
+		return nil
+	})
+	return remain, true, nil
+}
+
+// handleCNCredit 手动查询单个账号的积分余额。
+func (s *Server) handleCNCredit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	acc := s.cnLoadAccount(w, id)
+	if acc == nil {
+		return
+	}
+	if !s.cnBillingConfig().Configured() {
+		writeErr(w, http.StatusBadRequest,
+			"余额查询未启用：需要配置 CN_BILLING_BASE_URL 与 CN_BILLING_PRODUCT_CODE"+
+				"（华为 CodeArts 没有公开固定的余额端点，产品码取错会查到别的产品额度，所以不猜）")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	remain, _, err := s.refreshCNCredit(ctx, acc)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "查询余额失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit_remain": remain})
+}
+
+// handleCNCreditRefreshAll 手动刷新整个 CN 账号池的余额。
+// 并发 4：单账号查询很轻，但上游量级不明，别一把梭。
+func (s *Server) handleCNCreditRefreshAll(w http.ResponseWriter, r *http.Request) {
+	if !s.cnBillingConfig().Configured() {
+		writeErr(w, http.StatusBadRequest,
+			"余额查询未启用：需要配置 CN_BILLING_BASE_URL 与 CN_BILLING_PRODUCT_CODE")
+		return
+	}
+	list := s.db.List()
+	var targets []*store.Account
+	for _, a := range list {
+		if a != nil && store.IsCNAccount(a) {
+			targets = append(targets, a)
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+
+	var okN, failN int
+	var total int64
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, a := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(acc *store.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			remain, known, err := s.refreshCNCredit(ctx, acc)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil || !known {
+				failN++
+				return
+			}
+			okN++
+			total += remain
+		}(a)
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accounts": len(targets), "known": okN, "failed": failN, "pool_total": total,
+	})
+}
