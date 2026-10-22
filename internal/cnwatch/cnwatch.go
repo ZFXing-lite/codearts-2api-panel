@@ -37,6 +37,11 @@ const (
 	mdCheckinMsg     = "cn_last_checkin_msg"     // 最近签到结果摘要（面板展示）
 	mdCheckinCredits = "cn_last_checkin_credits" // 最近签到获得积分
 	mdCheckinAt      = "cn_last_checkin_at"      // 最近签到时间戳（RFC3339）
+	// 积分余额（需要 CN_BILLING_* 配置才能查到真实值）
+	mdCreditRemain   = "cn_credit_remain"     // 剩余积分（求和口径）
+	mdCreditFetched  = "cn_credit_fetched_at" // 最近一次成功查询时间（RFC3339）
+	mdCreditErr      = "cn_credit_error"      // 最近一次查询失败原因（脱敏）
+	mdCreditPackages = "cn_credit_packages"   // 套餐明细 JSON
 )
 
 // cnDay 以 Asia/Shanghai 日历日为准（签到日界与上游一致）。
@@ -52,6 +57,11 @@ const (
 	MetaLastActive   = mdLastActive
 	MetaLastPing     = mdLastKeepalive
 	MetaNeedsRelogin = mdNeedsRelogin
+	// 积分余额键（面板读取）
+	MetaCreditRemain   = mdCreditRemain
+	MetaCreditFetched  = mdCreditFetched
+	MetaCreditErr      = mdCreditErr
+	MetaCreditPackages = mdCreditPackages
 )
 
 // Client 抽象 cnup.Client，便于测试注入假实现；*cnup.Client 天然满足。
@@ -61,6 +71,7 @@ type Client interface {
 	ClaimBenefit(cred cnup.SignCredential) error
 	ChatStream(ctx context.Context, chatID string, messages []cnup.ChatMessage, traceID string, cred cnup.SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error)
 	FetchModels(acct *cnup.Account) ([]cnup.ModelInfo, error)
+	FetchCreditBalance(ctx context.Context, cfg cnup.BillingConfig, cred cnup.SignCredential) (*cnup.CreditBalance, error)
 }
 
 // Watcher CN 账号 watchdog。
@@ -174,7 +185,57 @@ func (w *Watcher) watchAccount(ctx context.Context, id string) {
 		w.claimBenefit(acc, cred)
 	}
 	w.refreshCatalog(acc)
+	w.refreshCreditBalance(ctx, acc, cred)
 	w.keepalive(ctx, acc, cred)
+}
+
+// refreshCreditBalance 查一次积分余额（未配置时直接跳过）。
+//
+// 华为 CodeArts 的余额要走华为云通用计量接口 + 产品码，没有产品码就不能查
+// （猜一个产品码会拿到别的产品额度，比不查更糟）。所以这里严格按配置执行，
+// 失败原因写进 Metadata 供面板显示，不再无声跳过。
+func (w *Watcher) refreshCreditBalance(ctx context.Context, acc *store.Account, cred cnup.SignCredential) {
+	bcfg := cnup.BillingConfig{
+		BaseURL:     w.cfg.CNBillingBaseURL,
+		ProductCode: w.cfg.CNBillingProductCode,
+		MeterPath:   w.cfg.CNBillingMeterPath,
+	}
+	if !bcfg.Configured() {
+		return
+	}
+	qctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	bal, err := w.client.FetchCreditBalance(qctx, bcfg, cred)
+	if err != nil {
+		msg := kit.Snippet(err.Error(), 200)
+		log.Printf("cnwatch: %s: credit balance failed: %s", acc.ID, msg)
+		_ = w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+			if fresh.Metadata == nil {
+				fresh.Metadata = map[string]string{}
+			}
+			fresh.Metadata[mdCreditErr] = msg
+			return nil
+		})
+		return
+	}
+	var pkJSON string
+	if len(bal.Packages) > 0 {
+		if b, err := json.Marshal(bal.Packages); err == nil {
+			pkJSON = string(b)
+		}
+	}
+	remain := strconv.FormatInt(bal.Remain, 10)
+	at := bal.FetchedAt.Format(time.RFC3339)
+	_ = w.db.Mutate(acc.ID, func(fresh *store.Account) error {
+		if fresh.Metadata == nil {
+			fresh.Metadata = map[string]string{}
+		}
+		fresh.Metadata[mdCreditRemain] = remain
+		fresh.Metadata[mdCreditFetched] = at
+		fresh.Metadata[mdCreditPackages] = pkJSON
+		delete(fresh.Metadata, mdCreditErr)
+		return nil
+	})
 }
 
 // refreshCatalog 在网关进程内做模型目录发现。

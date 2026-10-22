@@ -11,6 +11,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"sort"
@@ -46,6 +47,25 @@ type cnAccountView struct {
 	SuccessCount  int64  `json:"success_count"`
 	FailCount     int64  `json:"fail_count"`
 	Disabled      bool   `json:"disabled"`
+
+	// 积分余额（需要 CN_BILLING_* 配置；未配置时 CreditKnown=false）
+	CreditRemain  int64           `json:"credit_remain"`
+	CreditKnown   bool            `json:"credit_known"`
+	CreditFetched string          `json:"credit_fetched,omitempty"`
+	CreditError   string          `json:"credit_error,omitempty"`
+	CreditPacks   json.RawMessage `json:"credit_packages,omitempty"`
+	// 最近一次签到领到的积分（本地记录，与余额不是同一口径）
+	LastCheckinCredits string `json:"last_checkin_credits,omitempty"`
+}
+
+// cnCreditHint 说明池子总积分的口径。
+// 未知余额的账号不进合计——必须讲清楚，否则"池子总积分"看着完整其实缺人。
+func cnCreditHint(configured bool) string {
+	if !configured {
+		return "未启用余额查询：需配置 CN_BILLING_BASE_URL 与 CN_BILLING_PRODUCT_CODE" +
+			"（华为 CodeArts 没有公开固定的余额端点，产品码取错会查到别的产品额度，所以不猜）"
+	}
+	return "合计只统计已查到余额的账号；查询失败的账号不计入，原因见各账号的 credit_error"
 }
 
 // handleCNDashboard 汇总 CN 渠道运行状态，供面板「国内码道」页一次性渲染。
@@ -59,6 +79,10 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]cnAccountView, 0, 8)
 	callable, needsRelogin, tokenDue, checkinToday, disabledN := 0, 0, 0, 0, 0
+	var poolCredits int64          // 已知余额的账号合计
+	creditKnown, creditUnk := 0, 0 // 已知 / 未知余额的账号数
+	creditConfigured := strings.TrimSpace(s.cfg.CNBillingBaseURL) != "" &&
+		strings.TrimSpace(s.cfg.CNBillingProductCode) != ""
 	var lastActive time.Time
 	modelSet := map[string]int{} // model -> 可见账号数
 	today := cnTodayKey(now)
@@ -87,6 +111,17 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 			FailCount:     a.FailCount,
 			Disabled:      a.Disabled,
 		}
+		if raw := strings.TrimSpace(a.Metadata[cnwatch.MetaCreditRemain]); raw != "" {
+			if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil {
+				v.CreditRemain, v.CreditKnown = n, true
+			}
+		}
+		v.CreditFetched = a.Metadata[cnwatch.MetaCreditFetched]
+		v.CreditError = a.Metadata[cnwatch.MetaCreditErr]
+		if pk := strings.TrimSpace(a.Metadata[cnwatch.MetaCreditPackages]); pk != "" {
+			v.CreditPacks = json.RawMessage(pk)
+		}
+		v.LastCheckinCredits = a.Metadata["cn_last_checkin_credits"]
 		// token 状态判读
 		switch {
 		case a.TokenExpires.IsZero():
@@ -102,6 +137,12 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		if !a.TokenExpires.IsZero() {
 			v.TokenExpires = a.TokenExpires.Format(time.RFC3339)
+		}
+		if v.CreditKnown {
+			poolCredits += v.CreditRemain
+			creditKnown++
+		} else {
+			creditUnk++
 		}
 		if v.NeedsRelogin {
 			needsRelogin++
@@ -210,6 +251,13 @@ func (s *Server) handleCNDashboard(w http.ResponseWriter, r *http.Request) {
 		"account_views":   views,
 		"models":          models,
 		"config":          cfgView,
+		"credits": map[string]any{
+			"pool_total": poolCredits,
+			"known":      creditKnown,
+			"unknown":    creditUnk,
+			"configured": creditConfigured,
+			"hint":       cnCreditHint(creditConfigured),
+		},
 	})
 }
 

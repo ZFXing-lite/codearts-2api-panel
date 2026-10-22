@@ -2,12 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"go-codearts/internal/cnup"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go-codearts/internal/auth"
 	"go-codearts/internal/config"
@@ -183,5 +185,58 @@ func TestCNOAuthCallbackFallbackPage(t *testing.T) {
 func TestCNLoginPortParseStrict(t *testing.T) {
 	if got := portFromListen(":" + strconv.Itoa(0)); got != 0 {
 		t.Fatalf("port 0 should be rejected, got %d", got)
+	}
+}
+
+// 华为 portal 的第二次回调只带 code，既没有 ticket_id 也没有 secret。
+// 旧实现要求二者之一才能命中会话，于是这一步永远配不上对，
+// 登录卡在最后一步（页面停在占位页，轮询一直 pending）。
+func TestCNLoginCodeCallbackWithoutTicketID(t *testing.T) {
+	s, _ := newCNLoginServer(t)
+	// 注入一个立即失败的上游：本测试只验证「候选会话被找到并尝试换取」，
+	// 不依赖真实 ExchangeCode 成功。
+	s.cnOnce.Do(func() {
+		s.cnClient = cnup.NewWithChatEndpoint(200*time.Millisecond, "http://127.0.0.1:1")
+	})
+
+	w := httptest.NewRecorder()
+	s.handleCNLoginStart(w, httptest.NewRequest(http.MethodPost, "/api/cn/login/start",
+		strings.NewReader(`{"port":8911}`)))
+	var start struct {
+		SessionID string `json:"session_id"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &start)
+	if start.SessionID == "" {
+		t.Fatal("no session")
+	}
+
+	// 候选链必须能在没有任何判别键时找到这个活跃会话。
+	cands := s.cnLogins.codeCandidates("", "")
+	if len(cands) != 1 || cands[0].ID != start.SessionID {
+		t.Fatalf("codeCandidates=%d, want the single active session", len(cands))
+	}
+
+	// 只带 code 打回环回调：不能返回占位页，必须走到换取流程。
+	rec := httptest.NewRecorder()
+	s.handleCNOAuthCallback(rec, httptest.NewRequest(http.MethodGet,
+		"/oauth/callback?code=fake-code", nil))
+	body := rec.Body.String()
+	if strings.Contains(body, "codearts") && rec.Code == http.StatusOK && !strings.Contains(body, "换取") {
+		t.Fatalf("code callback fell through to placeholder page: %d %s", rec.Code, body)
+	}
+	// 换取失败应留下日志/错误，但会话不能被永久判死（还要能被后续候选复用）。
+	if done, errMsg, _ := cands[0].snapshot(); done && errMsg == "" {
+		t.Fatalf("session marked done without account")
+	}
+}
+
+// 带了 secret 却不属于任何活跃会话时不能瞎猜（防止串号）。
+func TestCNLoginCodeCandidatesRejectUnknownSecret(t *testing.T) {
+	s, _ := newCNLoginServer(t)
+	w := httptest.NewRecorder()
+	s.handleCNLoginStart(w, httptest.NewRequest(http.MethodPost, "/api/cn/login/start",
+		strings.NewReader(`{"port":8912}`)))
+	if got := s.cnLogins.codeCandidates("", "not-a-real-secret"); len(got) != 0 {
+		t.Fatalf("unknown secret must not match any session, got %d", len(got))
 	}
 }

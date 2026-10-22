@@ -2022,6 +2022,38 @@ function cnTokenBadge(v) {
   return `<span class="badge ${esc(cls)}">${esc(label)}</span>${exp}`;
 }
 
+// 国内积分展示。
+// 余额要 CN_BILLING_* 配置才能查（华为 CodeArts 没有公开固定端点），
+// 所以「未知」必须显式写出来，不能显示成 0——那是错的信息。
+function cnCreditCell(v) {
+  if (v.credit_known) {
+    const bug = v.credit_error ? ` <span class="badge br" title="${esc(v.credit_error)}">查询异常</span>` : "";
+    const when = v.credit_fetched ? `更新 ${fmtTime(v.credit_fetched)}` : "";
+    return `<span class="badge bg">${v.credit_remain}</span>` + bug +
+      `<div class="muted" style="font-size:11px">${esc(when)}</div>`;
+  }
+  if (v.credit_error) {
+    return `<span class="badge bb">未知</span>` +
+      `<div class="muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.credit_error)}">${esc(v.credit_error)}</div>`;
+  }
+  const c = (_cnCache && _cnCache.credits) || {};
+  return c.configured
+    ? `<span class="badge bb">未知</span>`
+    : `<span class="muted" style="font-size:11px">未启用</span>`;
+}
+
+function cnCreditCard(c) {
+  if (!c) return { icon: "💎", bg: "rgba(139,148,158,.12)", val: "—", key: "池子总积分", trend: "" };
+  const val = c.configured ? String(c.pool_total ?? 0) : "—";
+  const trend = c.configured
+    ? `已知 ${c.known || 0} 个账号${c.unknown ? ` · ${c.unknown} 个未知` : ""}`
+    : "需配置 CN_BILLING_*";
+  return {
+    icon: "💎", bg: "rgba(139,148,158,.12)", val, key: "池子总积分",
+    trend, title: c.hint || "",
+  };
+}
+
 async function loadCN() {
   let d;
   try {
@@ -2043,10 +2075,12 @@ async function loadCN() {
     { icon: "👥", bg: "rgba(78,168,255,.12)", val: d.accounts || 0, key: "CN 账号", trend: `可调用 ${d.callable || 0}` },
     { icon: "🔑", bg: "rgba(248,81,73,.12)", val: d.needs_relogin || 0, key: "待重新登录", trend: `Token 临期 ${d.token_due || 0}` },
     { icon: "🎁", bg: "rgba(63,185,80,.12)", val: `${d.checkin_today || 0}/${d.accounts || 0}`, key: "今日已签到", trend: d.today || "" },
+    cnCreditCard(d.credits),
   ];
   $("cn-stats").innerHTML = cards
     .map((c) =>
-      `<div class="stat"><div class="icon" style="background:${c.bg}">${c.icon}</div>` +
+      `<div class="stat"${c.title ? ` title="${esc(c.title)}"` : ""}>` +
+      `<div class="icon" style="background:${c.bg}">${c.icon}</div>` +
       `<div class="val">${esc(c.val)}</div><div class="key">${esc(c.key)}</div>` +
       `<div class="trend">${esc(c.trend || "")}</div></div>`)
     .join("");
@@ -2060,11 +2094,13 @@ async function loadCN() {
     const checkin = v.checkin_date
       ? `<span class="badge bg">✓ ${esc(v.checkin_date)}</span><div class="muted" style="font-size:11px" title="${esc(v.checkin_msg || "")}">${esc(v.checkin_msg || "")}</div>`
       : `<span class="badge bb">未签</span>`;
+    const credits = cnCreditCell(v);
     return `<tr>
       <td><div class="email" title="${esc(v.email)}">${esc(v.email || v.id)}</div>${errLine}</td>
       <td class="nowrap"><span class="muted" style="font-size:11px">${esc(v.user_id || "—")}</span></td>
       <td>${gate}</td>
       <td>${cnTokenBadge(v)}</td>
+      <td class="nowrap">${credits}</td>
       <td>${checkin}</td>
       <td class="nowrap">${esc(fmtTime(v.last_active || v.last_keepalive || ""))}</td>
       <td class="nowrap"><span class="badge bg">${v.success_count || 0}</span> / <span class="badge ${v.fail_count ? "br" : "bb"}">${v.fail_count || 0}</span></td>
@@ -2079,7 +2115,7 @@ async function loadCN() {
   });
   $("cn-acct-body").innerHTML = rows.length
     ? rows.join("")
-    : `<tr><td colspan="8" class="empty">暂无 CN 账号。用 <code>cnlogin</code> 登录后点「导入 auths 目录」，或把 auths/*.json 放进 CN_AUTH_DIR。</td></tr>`;
+    : `<tr><td colspan="9" class="empty">暂无 CN 账号。用 <code>cnlogin</code> 登录后点「导入 auths 目录」，或把 auths/*.json 放进 CN_AUTH_DIR。</td></tr>`;
 
   const models = d.models || [];
   $("cn-models").innerHTML = models.length
@@ -2136,9 +2172,12 @@ async function cnLoginPoll() {
     const status = $("cn-login-status");
     if (d.status === "done") {
       const a = d.account || {};
+      // 先落提示再收起登录盒：cnLoginReset() 会把整个盒子隐藏，
+      // 之后写进去的成功文案用户根本看不到，只会看到面板"没反应"。
+      const who = a.name || a.uid || a.email || "";
       cnLoginReset();
-      if (status) status.textContent = `登录成功：${a.name || a.uid || ""}（凭据已入库）`;
-      toast("国内码道账号已添加");
+      if (status) status.textContent = `登录成功：${who}（凭据已入库）`;
+      toast(`国内码道账号已添加${who ? "：" + who : ""}`);
       loadCN();
     } else if (d.status === "error") {
       if (status) status.textContent = "登录失败：" + (d.message || "");
@@ -2149,8 +2188,25 @@ async function cnLoginPoll() {
       if (status) status.textContent = d.message || "会话已过期，请重新生成链接";
     } else if (d.message && status) {
       status.textContent = d.message;
+      // 跨机部署：portal 回调的是操作员本机，本服务永远收不到 secret，
+      // 这时把粘贴框提示出来，别让人干等。
+      if (d.need_paste) {
+        const pasteBox = $("cn-login-paste");
+        if (pasteBox && !pasteBox.dataset.hinted) {
+          pasteBox.dataset.hinted = "1";
+          pasteBox.focus();
+          toast("若浏览器打不开 127.0.0.1，请把地址栏整条 URL 粘到下方提交");
+        }
+      }
     }
-  } catch (_) {}
+  } catch (e) {
+    // 轮询失败必须说出来：否则页面停在一个"看起来还在等"的状态，
+    // 用户会以为是自己操作错了。
+    const status = $("cn-login-status");
+    if (status) status.textContent = "状态查询失败：" + (e.message || "网络错误") + "（登录可能已失效，可重新发起）";
+    if (_cnLoginTimer) clearInterval(_cnLoginTimer);
+    _cnLoginTimer = null;
+  }
 }
 
 async function cnLoginSubmit() {

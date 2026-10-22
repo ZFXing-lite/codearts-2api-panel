@@ -2,6 +2,7 @@ package cnwatch
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -14,6 +15,9 @@ import (
 
 // fakeClient 记录调用并可编程返回错误。
 type fakeClient struct {
+	creditCalls  int
+	creditRes    *cnup.CreditBalance
+	creditErr    error
 	refreshErr   error
 	refreshRes   *cnup.TokenResponse
 	refreshCalls int
@@ -29,6 +33,11 @@ type fakeClient struct {
 func (f *fakeClient) FetchModels(*cnup.Account) ([]cnup.ModelInfo, error) {
 	f.modelCalls++
 	return f.modelRes, f.modelErr
+}
+
+func (f *fakeClient) FetchCreditBalance(context.Context, cnup.BillingConfig, cnup.SignCredential) (*cnup.CreditBalance, error) {
+	f.creditCalls++
+	return f.creditRes, f.creditErr
 }
 
 func (f *fakeClient) RefreshToken(context.Context, cnup.LoginConfig, string, string, cnup.DPoPPrivateJWK) (*cnup.TokenResponse, error) {
@@ -218,5 +227,58 @@ func TestKeepalive(t *testing.T) {
 	got, _ = db.SnapshotAccount("cn-3")
 	if got.Metadata["cn_needs_relogin"] == "true" {
 		t.Fatal("keepalive failure must not mark relogin")
+	}
+}
+
+// 未配置余额查询时绝不能去调上游：猜一个产品码会拿到别的产品额度。
+func TestCreditBalanceSkippedWhenNotConfigured(t *testing.T) {
+	db := openDB(t)
+	acc := cnAccount(db, "c1", time.Now().Add(time.Hour))
+	fc := &fakeClient{creditRes: &cnup.CreditBalance{Remain: 999}}
+	w := NewWithClient(db, config.Config{CNEnabled: true}, fc)
+	w.refreshCreditBalance(context.Background(), acc, cnup.SignCredential{})
+	if fc.creditCalls != 0 {
+		t.Fatalf("called upstream without config: %d", fc.creditCalls)
+	}
+}
+
+// 配置齐全时把余额与套餐明细写进 Metadata，供面板展示。
+func TestCreditBalanceRecorded(t *testing.T) {
+	db := openDB(t)
+	acc := cnAccount(db, "c2", time.Now().Add(time.Hour))
+	fc := &fakeClient{creditRes: &cnup.CreditBalance{
+		Remain:    4321,
+		Packages:  []cnup.CreditPackage{{Name: "签到包", Remain: 4321, Size: 5000}},
+		FetchedAt: time.Now(),
+	}}
+	cfg := config.Config{CNEnabled: true, CNBillingBaseURL: "https://bss.example", CNBillingProductCode: "p_x"}
+	w := NewWithClient(db, cfg, fc)
+	w.refreshCreditBalance(context.Background(), acc, cnup.SignCredential{SecurityToken: "t"})
+	if fc.creditCalls != 1 {
+		t.Fatalf("creditCalls=%d", fc.creditCalls)
+	}
+	got, err := db.Get("c2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[mdCreditRemain] != "4321" {
+		t.Fatalf("remain=%q", got.Metadata[mdCreditRemain])
+	}
+	if got.Metadata[mdCreditPackages] == "" {
+		t.Fatal("packages not recorded")
+	}
+}
+
+// 查询失败要留下原因，而不是静默保留旧值。
+func TestCreditBalanceErrorRecorded(t *testing.T) {
+	db := openDB(t)
+	acc := cnAccount(db, "c3", time.Now().Add(time.Hour))
+	fc := &fakeClient{creditErr: errors.New("product code invalid")}
+	cfg := config.Config{CNEnabled: true, CNBillingBaseURL: "https://bss.example", CNBillingProductCode: "p_x"}
+	w := NewWithClient(db, cfg, fc)
+	w.refreshCreditBalance(context.Background(), acc, cnup.SignCredential{SecurityToken: "t"})
+	got, _ := db.Get("c3")
+	if got.Metadata[mdCreditErr] == "" {
+		t.Fatal("failure reason not recorded")
 	}
 }

@@ -70,6 +70,12 @@ type Config struct {
 	CNWatchPoll         time.Duration // watchdog poll cycle
 	CNRefreshSkew       time.Duration // refresh token this early before expiration
 	CNUpstreamTimeout   time.Duration
+	// CN 积分余额查询。华为 CodeArts 没有公开固定的余额端点：走华为云通用
+	// 计量计费接口，产品码随产品而变。不配置就不查（面板显示"未启用"），
+	// 绝不用猜的产品码去查——那会拿到别的产品口径。
+	CNBillingBaseURL     string // 如 https://bss.myhuaweicloud.com
+	CNBillingProductCode string // 如 p_xxxxxxxx
+	CNBillingMeterPath   string // 缺省 /v2/billing/meter/get-user-resource
 	// CNOAuthCallbackHost 可选：反向代理暴露的公网回调入口（如
 	// https://panel.example.com:443）。只有显式写了端口才改写授权链接里的
 	// port 参数；不写端口保持本机 127.0.0.1 回调不变。
@@ -139,6 +145,9 @@ func Get() Config {
 		CNWatchPoll:         envDuration("CN_WATCH_POLL", 30*time.Minute),
 		CNRefreshSkew:       envDuration("CN_REFRESH_SKEW", 30*time.Minute),
 		CNUpstreamTimeout:   envDuration("CN_UPSTREAM_TIMEOUT", 120*time.Second),
+		CNBillingBaseURL:     envOr("CN_BILLING_BASE_URL", ""),
+		CNBillingProductCode: envOr("CN_BILLING_PRODUCT_CODE", ""),
+		CNBillingMeterPath:   envOr("CN_BILLING_METER_PATH", ""),
 		CNOAuthCallbackHost: envOr("CN_OAUTH_CALLBACK_HOST", ""),
 	}
 	if cfg.PublicURL == "" {

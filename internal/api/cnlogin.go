@@ -23,9 +23,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -332,8 +334,15 @@ func (s *Server) handleCNLoginStatus(w http.ResponseWriter, r *http.Request) {
 	// 否则本地 secret 上游不认，轮询只会白白撞墙。
 	secret, fallback := sess.pollSecret()
 	if !fallback {
+		// 还没收到过 portal 的 secret，说明回调一次都没到达本服务。
+		// 跨机部署下这是常态（portal 回调的是操作员本机的 127.0.0.1），
+		// 必须直接告诉用户去粘贴，否则会一直盯着"等待授权"。
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "pending", "message": "等待浏览器完成授权…",
+			"status": "pending",
+			"message": "等待浏览器完成授权…若浏览器打不开 127.0.0.1 那个地址，是跨机部署的正常现象：" +
+				"把地址栏整条 URL 粘到「粘贴回调地址」提交即可。",
+			"need_paste": true,
+			"auth_url":   sess.AuthURL,
 		})
 		return
 	}
@@ -431,17 +440,19 @@ func (s *Server) cnApplySecret(sess *cnLoginSession, secret, nextURL string) (st
 }
 
 // cnApplyCode 用授权码换 token 并落盘入库。
+// cnApplyCode 用授权码换 token 并落盘入库。
+//
+// 失败时**不**把会话标记为终止：带 code 的回调没有 ticket_id 时是逐个候选
+// 试出来的，单次失败只说明这个 verifier 不匹配，后面的候选还要继续用同一
+// 个会话。终止判定交给调用方（全部候选都失败后才标错误）。
 func (s *Server) cnApplyCode(r *http.Request, sess *cnLoginSession, code string) error {
 	lcfg := cnup.DefaultLoginConfig()
 	tok, err := s.cnUpstream().ExchangeCode(r.Context(), lcfg, code, sess.Verifier, sess.Port, sess.DPoP)
 	if err != nil {
-		msg := "换取 token 失败: " + err.Error()
-		sess.markErr(msg)
-		return fmt.Errorf("%s", msg)
+		return fmt.Errorf("换取 token 失败: %w", err)
 	}
 	acct, err := s.saveCNLogin(tok, sess.Verifier, sess.DPoP)
 	if err != nil {
-		sess.markErr(err.Error())
 		return err
 	}
 	sess.markDone(acct)
@@ -452,20 +463,27 @@ func (s *Server) cnApplyCode(r *http.Request, sess *cnLoginSession, code string)
 // 该路径与国际版共用，按 query 特征分流；没有 CN 会话时退回提示页。
 func (s *Server) handleCNOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	sess := s.cnLogins.byTicket(q.Get("ticket_id"))
-	if sess == nil && q.Get("secret") != "" {
-		// portal 首次回调可能不带 ticket_id，退回"唯一活跃会话"判定。
-		sess = s.cnLogins.onlyActive()
-	}
-	if sess == nil {
-		s.serveOAuthPlaceholder(w, r)
-		return
-	}
+	code := strings.TrimSpace(q.Get("code"))
+	secret := strings.TrimSpace(q.Get("secret"))
 
-	// 第一步：只有 secret。必须 307 回 redirect，portal 才会继续下发 code。
-	if q.Get("code") == "" {
-		nextURL, err := s.cnApplySecret(sess, q.Get("secret"), q.Get("redirect"))
+	// 第一步：只带 secret + redirect。必须 307 回 redirect，portal 才会继续
+	// 下发 code。这一步能用 redirect 里的 ticket_id 精确定位会话。
+	if code == "" {
+		sess := s.cnLogins.byTicket(q.Get("ticket_id"))
+		if sess == nil {
+			if cands := s.cnLogins.codeCandidates("", secret); len(cands) > 0 {
+				sess = cands[0]
+			}
+		}
+		if sess == nil {
+			log.Printf("cn oauth: secret callback with no session (ticket=%q has_secret=%v has_redirect=%v)",
+				q.Get("ticket_id"), secret != "", q.Get("redirect") != "")
+			s.serveOAuthPlaceholder(w, r)
+			return
+		}
+		nextURL, err := s.cnApplySecret(sess, secret, q.Get("redirect"))
 		if err != nil {
+			log.Printf("cn oauth: secret callback rejected: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -473,26 +491,87 @@ func (s *Server) handleCNOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 第二步：带 code，换 token 后给用户一个可读的结果页。
-	_ = s.cnApplyCode(r, sess, q.Get("code"))
-	s.cnCallbackPage(w, sess)
+	// 第二步：带 code。华为 portal 这一跳可能既没有 ticket_id 也没有 secret，
+	// 只能逐个候选去换：授权码与 PKCE verifier 一对一绑定，用错只会得到
+	// STS5.1805 且不消耗授权码，所以逐个试是安全的。只挑一个（旧做法）
+	// 会在服务重启过、或同时开过两次登录时必然错配。
+	cands := s.cnLogins.codeCandidates(q.Get("ticket_id"), secret)
+	if len(cands) == 0 {
+		log.Printf("cn oauth: code callback with no candidate session (ticket=%q has_secret=%v)",
+			q.Get("ticket_id"), secret != "")
+		s.serveOAuthPlaceholder(w, r)
+		return
+	}
+	var lastErr error
+	for _, sess := range cands {
+		if err := s.cnApplyCode(r, sess, code); err != nil {
+			lastErr = err
+			continue
+		}
+		s.cnCallbackPage(w, sess)
+		return
+	}
+	log.Printf("cn oauth: code exchange failed on %d candidate(s): %v", len(cands), lastErr)
+	if lastErr != nil {
+		for _, sess := range cands {
+			sess.markErr(lastErr.Error())
+		}
+		http.Error(w, lastErr.Error(), http.StatusBadGateway)
+		return
+	}
+	s.serveOAuthPlaceholder(w, r)
 }
 
-// onlyActive 在恰好只有一个未完成会话时返回它（portal 回调不带 ticket_id 的兜底）。
-func (s *cnLoginStore) onlyActive() *cnLoginSession {
+// codeCandidates 返回一个授权码可能归属的会话，按可信度排序。
+//
+// 实测（华为 portal）：第二次回调只带 code，`has_code=true has_secret=false
+// has_redirect=false` —— 既没有 ticket_id 也没有 secret。旧实现要求
+// ticket_id 或 secret 才能命中会话，于是带 code 的回调永远配不上对，
+// 直接掉进占位页，登录卡在最后一步。
+//
+// 判别顺序：
+//  1. secret 命中（部分部署会带；带了却不命中说明会话已失效，不再猜）
+//  2. ticket_id 命中
+//  3. 都没有判别键时，返回全部活跃会话（新建的排前面）由调用方逐个试
+func (s *cnLoginStore) codeCandidates(ticketID, secret string) []*cnLoginSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var found *cnLoginSession
+	s.gcLocked()
+	if secret != "" {
+		for _, sess := range s.m {
+			if done, _, _ := sess.snapshot(); done {
+				continue
+			}
+			if sess.pollSecretMatch(secret) {
+				return []*cnLoginSession{sess}
+			}
+		}
+		return nil
+	}
+	if ticketID != "" {
+		if sess := s.byTk[ticketID]; sess != nil {
+			if done, _, _ := sess.snapshot(); !done {
+				return []*cnLoginSession{sess}
+			}
+		}
+		return nil
+	}
+	out := make([]*cnLoginSession, 0, len(s.m))
 	for _, sess := range s.m {
 		if done, _, _ := sess.snapshot(); done {
 			continue
 		}
-		if found != nil {
-			return nil
-		}
-		found = sess
+		out = append(out, sess)
 	}
-	return found
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.After(out[j].Created) })
+	return out
+}
+
+// pollSecretMatch 判断回传的 secret 是否属于本会话（含 portal 下发后的值）。
+func (s *cnLoginSession) pollSecretMatch(secret string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.secret != "" && s.secret == secret
 }
 
 func (s *Server) cnCallbackPage(w http.ResponseWriter, sess *cnLoginSession) {
@@ -528,10 +607,50 @@ func (s *Server) cnCallbackPage(w http.ResponseWriter, sess *cnLoginSession) {
 // serveOAuthPlaceholder 是国际版 OAuth 的提示页（无 CN 会话时）。
 func (s *Server) serveOAuthPlaceholder(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!doctype html><html><body style="font-family:system-ui;padding:40px">
-<h2>请用本地回调完成授权</h2>
-<p>CodeArts OAuth 必须回调到 127.0.0.1。请回到面板重新发起授权（国际版走 CLI 授权页，国内码道走「国内码道」页）。</p>
-</body></html>`)
+	w.Header().Set("Cache-Control", "no-store")
+	q := r.URL.Query()
+	// 分情况给话：只说"请重新发起"会让用户以为是自己点错了，
+	// 实际最常见的是「回调到了但网关这边没有配对的会话」（重启/过期/多标签）。
+	var title, detail, action string
+	switch {
+	case q.Get("code") != "":
+		title = "授权回调已到达，但没有匹配的登录会话"
+		detail = "授权码换 token 需要发起登录时生成的 PKCE verifier，它只存在于该次登录会话里。" +
+			"网关重启过、会话超过有效期、或这次登录已经被别处完成，都会落到这里。"
+		action = "回到面板「国内码道」页重新点「生成登录链接」，用新链接登录一次即可。"
+	case q.Get("secret") != "" || q.Get("redirect") != "":
+		title = "授权回调已到达，但没有匹配的登录会话"
+		detail = "回调带了 secret/redirect，但找不到它对应的那次登录（多半是网关重启或会话过期）。"
+		action = "回到面板重新发起授权。"
+	default:
+		title = "这条地址需要浏览器本地回调才能完成"
+		detail = "CodeArts OAuth 只回调到 127.0.0.1:<port>/oauth/callback。" +
+			"如果网关跑在远端服务器上，你电脑上的 127.0.0.1 并没有这个服务，直接打开会失败——这是正常的。"
+		action = "把浏览器地址栏里那条完整 URL（含 code 或 secret 参数）复制，粘到面板「国内码道 → 粘贴回调地址」，提交即可完成登录。"
+	}
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>%s</title></head>
+<body style="font-family:system-ui;padding:40px;max-width:720px;line-height:1.6">
+<h2>%s</h2>
+<p>%s</p>
+<p><b>下一步：</b>%s</p>
+<p style="color:#666;font-size:13px">诊断：has_code=%v has_secret=%v has_redirect=%v has_ticket=%v active_sessions=%d</p>
+</body></html>`,
+		htmlEscape(title), htmlEscape(title), htmlEscape(detail), htmlEscape(action),
+		q.Get("code") != "", q.Get("secret") != "", q.Get("redirect") != "",
+		q.Get("ticket_id") != "", s.cnLogins.activeCount())
+}
+
+// activeCount 返回未完成的登录会话数（占位页诊断用）。
+func (s *cnLoginStore) activeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, sess := range s.m {
+		if done, _, _ := sess.snapshot(); !done {
+			n++
+		}
+	}
+	return n
 }
 
 func htmlEscape(s string) string {
